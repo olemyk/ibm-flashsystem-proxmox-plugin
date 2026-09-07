@@ -764,10 +764,20 @@ sub alloc_image {
 # threshold, and real capacity grew ahead of the data on write — autoexpand
 # confirmed working.
 #
-# VALIDATE: data reduction pools apply their own rules to space-efficient
-# volumes and were NOT covered by that test. Confirm on a scratch DRP before
-# enabling fsthin on one. (IBM is moving away from DRPs, so the standard-pool
-# path above is the strategically relevant one.)
+# ANSWERED 2026-09-07, and the answer is no: data reduction pools apply their
+# own rules to space-efficient volumes, were NOT covered by the test above,
+# and the array refused thin volumes when fsthin was enabled against four DRP
+# -backed storages on a production cluster. It was reverted the same day. The
+# standard-pool validation does NOT carry over to a DRP - so treat fsthin as
+# a STANDARD-POOL feature until someone demonstrates otherwise. (IBM is
+# moving away from DRPs, so the standard-pool path above is the
+# strategically relevant one anyway.)
+#
+# This is also self-consistent with how a DRP already behaves: the pool does
+# its own thin/dedup/compression, so a "fully allocated" vdisk in a DRP is
+# not the straightforward waste it would be on a standard pool - and
+# lssevdiskcopy reports blank capacity fields for space-efficient copies in a
+# DRP, which is why the consumption view already skips those pools entirely.
 # VALIDATE: thin means overcommit — have array-side physical-free alerting in
 # place before enabling on pools shared with other workloads, and note IBM's
 # hint that capacity reporting changes in 9.x firmware.

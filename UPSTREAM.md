@@ -96,10 +96,21 @@ real capacity, reported by the array as *Capacity savings: Thin-provisioned*
 at an 80% warning threshold, and real capacity grew ahead of the data as it
 was written — autoexpand confirmed working.
 
-**Not yet validated on a data reduction pool.** DRPs apply their own rules
-to space-efficient volumes; test on a scratch DRP before enabling `fsthin`
-on one. (IBM state they are moving away from DRPs, so the standard-pool path
-is the strategically relevant one.)
+**Does not work on a data reduction pool** — tested 2026-09-07 and reverted
+the same day. `fsthin` was enabled on four DRP-backed storages on a
+production cluster and the array would not create thin volumes there. So the
+standard-pool validation above does **not** carry over: treat `fsthin` as a
+standard-pool feature. (IBM state they are moving away from DRPs, so the
+standard-pool path is the strategically relevant one anyway.)
+
+This is at least consistent with the rest of DRP behaviour: the pool already
+performs its own thin/dedup/compression, so a fully-allocated vdisk inside a
+DRP is not the plain waste it would be on a standard pool — and
+`lssevdiskcopy` returns blank capacity fields for space-efficient copies in a
+DRP, which is why the consumption view (§4) skips those pools outright. If
+IBM can say what the intended `mkvdisk -rsize` behaviour is inside a DRP,
+that would be worth documenting here — it is the one place where the sample's
+provisioning path and DRPs meet and the answer is currently just "no".
 
 **Thin means overcommit.** Have array-side physical-free alerting in place
 before enabling on any pool shared with other workloads — a pool driven to
