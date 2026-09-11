@@ -52,6 +52,23 @@ Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
   volume's contents *without deleting any object*, so it trips no capacity or
   object-count monitoring. An unknown or absent state refuses, like the
   `volume_size_mismatch` guard beside it.
+- **`PVE::Storage::cluster_lock_storage` does not exist.** The lock below was
+  added calling it, and it got through because `tests/stub/PVE/Storage.pm`
+  *defined* the invented function — so 213 API cases validated an API PVE has
+  never had. It failed on the first live `CreateSnapshot` with `Undefined
+  subroutine`. The real symbol is a CLASS METHOD on the plugin base class,
+  `PVE::Storage::Plugin->cluster_lock_storage($storeid, $shared, $timeout,
+  $func, @param)` (`/usr/share/perl5/PVE/Storage/Plugin.pm:759`), which with
+  `$shared` true locks through `PVE::Cluster::cfs_lock_storage` — pmxcfs, i.e.
+  genuinely cluster-wide, which is what was wanted.
+  Three things changed, not one: the call site; the stub, which now lives in
+  the right package with the real signature and *refuses a function-style
+  call*, so reintroducing the mistake fails a test; and the role's `api.yml`,
+  which now asserts at install time that the PVE symbols the module calls
+  actually resolve. That last gap is why this reached production — the
+  post-install check exercised the INDEX endpoint and the 12-node verification
+  was a GET, so both passed while every POST was broken. A symbol resolved at
+  call time is invisible to `perl -c`.
 - **The mutating CSI endpoints hold the cluster storage lock.** Every write is
   read-then-act, and Storage Virtualize snapshot names are not system-unique,
   so two concurrent `CreateSnapshot`s for one CSI name both saw "absent" and

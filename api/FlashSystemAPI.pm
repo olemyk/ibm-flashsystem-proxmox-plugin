@@ -40,6 +40,7 @@ use PVE::JSONSchema qw(get_standard_option);
 use PVE::RESTHandler;
 use PVE::RPCEnvironment;
 use PVE::Storage;
+use PVE::Storage::Plugin;
 
 # The storage plugin provides _cmd/_one/_volname_from_array/_pool_usage. On a
 # node it loads by module name; in the unit tests it has already been loaded
@@ -1228,7 +1229,26 @@ __PACKAGE__->register_method({
 # which is what this needs, since the driver may reach any node.
 sub _fs_locked {
     my ($storeid, $scfg, $code) = @_;
-    return PVE::Storage::cluster_lock_storage($storeid, $scfg->{shared}, undef, $code);
+    # PVE::Storage::Plugin->cluster_lock_storage - a CLASS METHOD on the
+    # plugin base class, not a function in PVE::Storage. An earlier cut called
+    # PVE::Storage::cluster_lock_storage, which does not exist anywhere in
+    # PVE, and every API test passed anyway because the test stub had defined
+    # the invented function. It failed on the first real CreateSnapshot with
+    # "Undefined subroutine &PVE::Storage::cluster_lock_storage".
+    #
+    # Verified against /usr/share/perl5/PVE/Storage/Plugin.pm:759 on a node:
+    #   sub cluster_lock_storage {
+    #       my ($class, $storeid, $shared, $timeout, $func, @param) = @_;
+    #
+    # $shared true  -> PVE::Cluster::cfs_lock_storage, i.e. through pmxcfs, so
+    #                  the lock holds across all 12 nodes. This is the case
+    #                  that matters: our storages are all shared 1, and the
+    #                  driver may reach any node.
+    # $shared false -> a local flock under /var/lock/pve-manager.
+    # It dies on the inner code's error rather than swallowing it, so a failed
+    # snapshot still surfaces to the caller.
+    return PVE::Storage::Plugin->cluster_lock_storage(
+        $storeid, $scfg->{shared}, undef, $code);
 }
 
 sub _fs_scfg {

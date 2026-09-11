@@ -746,7 +746,7 @@ ok_case('events: total restored when filter ignored', $ignored->{unfixed_total},
             $orig{$m} = \&{"PVE::Storage::Custom::FlashSystemPlugin::$m"};
             my $name = $m;
             *{"PVE::Storage::Custom::FlashSystemPlugin::$m"} = sub {
-                push @calls, { method => $name, locked => ($PVE::Storage::LOCK_DEPTH > 0) };
+                push @calls, { method => $name, locked => ($PVE::Storage::Plugin::LOCK_DEPTH > 0) };
                 return {};
             };
         }
@@ -766,7 +766,7 @@ ok_case('events: total restored when filter ignored', $ignored->{unfixed_total},
                [ 'snapshot_list', 0, { storage => 'k8s-archive' } ]) {
         my ($name, $want_lock, $param) = @$t;
         @calls = ();
-        local @PVE::Storage::LOCKS = ();
+        local @PVE::Storage::Plugin::LOCKS = ();
         my $h = $by_name->{$name};
         ok_case("$name: registered", ($h ? 'yes' : 'no'), 'yes');
         next if !$h;
@@ -775,14 +775,23 @@ ok_case('events: total restored when filter ignored', $ignored->{unfixed_total},
         ok_case("$name: reached the plugin", scalar(@calls), 1);
         ok_case("$name: lock held during the call",
             (@calls ? ($calls[0]{locked} ? 1 : 0) : -1), $want_lock);
-        ok_case("$name: locks taken", scalar(@PVE::Storage::LOCKS), $want_lock);
+        ok_case("$name: locks taken", scalar(@PVE::Storage::Plugin::LOCKS), $want_lock);
         if ($want_lock) {
             ok_case("$name: locks the right storage",
-                $PVE::Storage::LOCKS[0]{storeid}, 'k8s-archive');
+                $PVE::Storage::Plugin::LOCKS[0]{storeid}, 'k8s-archive');
+            # The lock MUST be reached as a class method on
+            # PVE::Storage::Plugin. The stub refuses a function-style call, so
+            # this case fails loudly if anyone reintroduces
+            # PVE::Storage::cluster_lock_storage — which does not exist in PVE
+            # and cost a live CreateSnapshot to discover.
+            ok_case("$name: lock is the real PVE symbol",
+                (PVE::Storage::Plugin->can('cluster_lock_storage') ? 1 : 0), 1);
+            ok_case("$name: not a PVE::Storage function",
+                (defined &PVE::Storage::cluster_lock_storage ? 'invented' : 'absent'), 'absent');
             # $shared must be passed through: with it false the lock is
             # per-node, and the driver may reach any of the 12 nodes.
             ok_case("$name: lock is cluster-wide",
-                ($PVE::Storage::LOCKS[0]{shared} ? 1 : 0), 1);
+                ($PVE::Storage::Plugin::LOCKS[0]{shared} ? 1 : 0), 1);
         }
     }
     {
