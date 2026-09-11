@@ -3,6 +3,181 @@
 Pre-release history, condensed from internal deployment tags. Dates are when
 the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
+## Unreleased — 2026-09-10
+
+Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
+`proxmox-csi-plugin` (`csi/`), and the Helm bundle to install and test it.
+**Unvalidated against hardware.**
+
+- **Four CSI endpoints** under `/nodes/{node}/flashsystem/{storage}/` —
+  snapshot create/list/delete and volume-from-snapshot. The CSI driver calls
+  them with its **existing Proxmox token**, so no array credential enters
+  Kubernetes and `fsprefix` never leaves the Proxmox side. Writes require
+  `Datastore.Allocate`; only the listing accepts `Datastore.Audit`.
+- **`csi_*` plugin methods** carrying the naming contract. The array caps
+  object names at 63 chars, leaving exactly nine for a snapshot name on a
+  4-char prefix, so the array-side component is
+  `base32(top 45 bits of sha256(csi name))` with **a leading digit** —
+  deterministic, because CSI `CreateSnapshot` is idempotent by name. The
+  leading digit is load-bearing, not cosmetic: `pve-snapshot-name` is
+  `/^[a-z][a-z0-9_-]+$/i`, and nine characters is the *only* PVE snapshot-name
+  length that fits the 63-char cap on a `k8s-*` storage, so a shape check
+  alone let `qm snapshot <vm> preupdate` parse as a CSI snapshot — after which
+  `csi_snapshot_list` reported the operator's rollback point to Kubernetes as a
+  leaked orphan and `csi_snapshot_delete` `rmsnapshot`ed it, while PVE's
+  vmconfig still listed it so the loss surfaced only at `qm rollback`. Minting
+  ours outside PVE's grammar makes the two namespaces structurally disjoint,
+  and `volume_snapshot` refuses a CSI-shaped name from the other direction. A component that already belongs to
+  a **different** volume is refused with `ALREADY_EXISTS` rather than aliased:
+  aliasing would return a handle pointing at another PVC's snapshot.
+- **`fsrestore`, default off.** The restore path rests on `mkvolume`, which
+  this plugin has never issued. Gated separately from `fssnapshots` so
+  enabling the production-proven half does not enable the unproven one. It
+  gates **both** `mkvolume` call sites — `csi_volume_from_snapshot` *and*
+  `clone_image`. Gating only the first left `qm clone <vmid> <new> --snapshot
+  <s> --full 0` issuing the unvalidated command with the flag at its default,
+  on a fleet where `fssnapshots` has been on since 2026-08-12.
+  `volume_has_feature` also stops advertising `clone` while the gate is
+  closed, so qemu-server refuses before the plugin is reached.
+- **`fsreapsnapshots`, default off.** Previously `free_image` always reaped a
+  volume's snapshots when the array refused to delete it. That turns
+  `kubectl delete pvc` into silent destruction of every recovery point, so the
+  refusal now propagates unless this is explicitly enabled.
+- **Only `active` counts as ready, everywhere.** IBM's `lsvolumesnapshot`
+  reference: *"Ready: If the snapshot is not triggered. Active: Maintain the
+  snapshot image."* So `Ready` is the opposite of usable. Beyond
+  `ready_to_use`, all three commands that need a real point-in-time image now
+  refuse without one — `volume_snapshot_rollback`, `clone_image` and
+  `csi_volume_from_snapshot` — because `restorefromsnapshot` overwrites a
+  volume's contents *without deleting any object*, so it trips no capacity or
+  object-count monitoring. An unknown or absent state refuses, like the
+  `volume_size_mismatch` guard beside it.
+- **The mutating CSI endpoints hold the cluster storage lock.** Every write is
+  read-then-act, and Storage Virtualize snapshot names are not system-unique,
+  so two concurrent `CreateSnapshot`s for one CSI name both saw "absent" and
+  both succeeded — leaving two array objects of which `csi_snapshot_delete`
+  can only ever remove the first. `external-snapshotter` retries on any error,
+  including a read-back that timed out after `addsnapshot` had taken effect, so
+  this was reachable. The read endpoint deliberately does not lock.
+- **Delete tells absence from unattributable.** `_snapshots_for` dropped a
+  disagreeing `volume_name` in non-strict mode too, so the loose re-scan that
+  exists to catch this could not see it and returned `reason: 'absent'` — which
+  the Go side maps to nil and Kubernetes records as reclaimed capacity, for a
+  snapshot still holding it. A new `any_owner` mode matches on the name alone
+  for exactly this comparison, and never for anything that acts on the row.
+- **Create reads back strictly**, matching delete. On a firmware that omits
+  `volume_name`, every create used to succeed and every delete fail
+  permanently; it now fails on the first snapshot, while nothing has leaked.
+- **`LIST_SNAPSHOTS` is advertised** (a sixth patch hunk). Unadvertised,
+  `external-snapshotter` treats it as *assume the snapshot is valid* and reports
+  a pre-provisioned `VolumeSnapshotContent` `readyToUse: true` without asking
+  the driver — and that shortcut is the only place readiness is decided on that
+  path. Upstream's `TestControllerServiceControllerGetCapabilities` pins the
+  capability count, so the patch bumps 9 → 10 in `controller_test.go`.
+- **`tools/probe-clone-from-snapshot.sh` could not run at all.** `fs()`
+  assigned `FS_HTTP` inside the command substitution every one of its ~29 call
+  sites wraps it in, so the parent's copy stayed empty for the whole run:
+  `fs_ok()` was always false and the probe died at step 0 against a healthy
+  array, printing `lsmdiskgrp failed (HTTP )` beside the successful body. The
+  status now crosses the subshell boundary through a temp file, read with
+  `fs_http()`. This is the script that gates `fsrestore`, so until now that
+  flag could not honestly be enabled.
+- **The install commands were wrong in two ways.** `--force-conflicts` is not a
+  Helm 3 flag (`helm upgrade` exits `Error: unknown flag` before rendering);
+  and the command inside `values-flashsystem.yaml` omitted the cloud-config,
+  which renders **zero** credential Secrets while still mounting one — a fresh
+  install hangs in `ContainerCreating`, and an *upgrade* deletes the working
+  Secret and rolls the pod in the same operation, taking provisioning, attach
+  and resize down for every existing PVC under a green `helm upgrade`.
+- **`smoke-test.yaml` is split in two.** Applied as one file it cut the array
+  snapshot concurrently with the 64 MiB write and started the verify job
+  immediately, so the checksum comparison — the actual test — failed on a
+  working array. Part 2 (`smoke-test-restore.yaml`) is applied after
+  `job/fs-smoke-write` completes. Cleanup order is now documented too: with
+  `thinclone`, the restored volume pins its source snapshot and the array
+  defers that snapshot's removal, which is indistinguishable from a delete
+  that silently freed nothing.
+- **`ready` was inverted.** IBM's `lsvolumesnapshot` reference defines
+  *"Ready: If the snapshot is not triggered"* — the opposite of
+  `ready_to_use`. The allowlist accepted both `active` and `ready`, so
+  Kubernetes would have been told a snapshot was usable before any
+  point-in-time image existed. Now `active` only, with anything unrecognised
+  treated as not-ready.
+- **Snapshot names are constrained to the digest grammar.** Without it, every
+  ordinary PVE snapshot on the same storage (`<vdisk>.vzdump`, a GUI snapshot)
+  parsed as a CSI snapshot — so listing reported them to Kubernetes, delete
+  accepted a handle naming one, and restore would clone from one.
+- **Delete distinguishes absent from unattributable.** Only genuine absence is
+  reported as success, which is what the CSI spec requires. A row the array
+  lists but cannot attribute to the owning volume is an error, because
+  reporting it deleted leaks physical capacity in a data reduction pool.
+- **Restore resolves its source strictly** (`strict => 1`), and the
+  target-name existence check fails **closed**: only the plugin's own
+  not-found error may be read as absence, so an unreachable array no longer
+  looks like a free name.
+- 24 further unit cases (163 → 187), including one per documented array
+  snapshot state.
+
+## Unreleased — 2026-09-09
+
+Array-side capability for Kubernetes volume snapshots. Everything below is
+**unvalidated against hardware** except the DRP diagnosis;
+`tools/probe-clone-from-snapshot.sh` is the gate.
+
+- **`fsthin` works on a data reduction pool.** The 2026-09-07 failure was one
+  parameter, not the feature: a DRP rejects `-warning` on a thin volume with
+  `CMMVC9236E`, which is *parameter validation* — the `80%` value is never
+  evaluated and it fails on an empty pool too. `_mkvdisk_params` takes a
+  fourth argument `$drp` and omits `warning` when set; new `_pool_is_drp`
+  supplies it from one `lsmdiskgrp`, called only when `fsthin` is on so the
+  thick path stays at exactly one REST call. `-rsize` is kept even though a
+  DRP ignores its value, because dropping it silently produces **thick**
+  volumes; `-autoexpand` turns out to be *required* there and was already
+  sent. A DRP thin volume has no per-volume capacity warning at all, so
+  pool-layer alerting becomes the whole alerting story — UPSTREAM.md §1e.
+- **Clone from snapshot** via PVE's `clone_image` hook and the array's
+  `mkvolume -type thinclone|clone -fromsourcevolume -fromsnapshotid -name`.
+  The derived volume gets a conforming PVE volname, so `list_images` surfaces
+  it with nothing else to update. New per-storage `fsclonetype`: `thinclone`
+  (default — instant and space-efficient, permanently dependent on the source
+  snapshot) or `clone` (independent after a background copy at IBM's 2 MB/s
+  default). `volume_has_feature` advertises `clone` **only** with a snapname
+  and `fssnapshots`; base images and templates remain unsupported. Testable
+  with `qm clone --snapshot --full 0` (the `--full 0` is required: a full clone
+  never calls the plugin's clone hook), no Kubernetes required.
+- **`volume_rollback_is_possible` is now overridden** — it previously
+  inherited an unconditional yes. Refuses when `lsvolumesnapshot` reports
+  `volume_size_mismatch=yes`, which the array would refuse anyway but with an
+  opaque CMMVC. Matters because `allowVolumeExpansion` is on for every
+  Kubernetes tier, so a routine PVC resize invalidates rollback for every
+  snapshot that volume already had.
+- **Snapshot lookups are scoped to one volume.** `_snapshot_id` matched on
+  `snapshot_name` alone across an unfiltered system-wide `lsvolumesnapshot`,
+  first match wins, feeding `restorefromsnapshot` directly — and Storage
+  Virtualize snapshot names are not system-unique (hence `rmsnapshot`'s
+  `-parentuid`), on an array shared with the whole VM estate and a VMware
+  estate. New `_snapshots_for` scopes by the `<arrayname>.` prefix plus a
+  `volume_name` cross-check. Correctness, not performance.
+- **`free_image` reaps the volume's own snapshots before `rmvdisk`**, which
+  is issued with no `-force` and so is refused rather than forced on a busy
+  volume. Scoped to `<arrayname>.*`, never a broad sweep.
+- **`_cmd` re-authenticates on 403 as well as 401.** IBM documents token
+  expiry as 403, and the lifetime as a maximum session rather than an idle
+  timeout, so polling cannot keep a token warm past it.
+- `alloc_image` warns at creation time when `fssnapshots` is on and the array
+  name leaves no room for a snapshot name. The fix is a shorter `fsprefix`,
+  which is fixed at storage creation, so the first snapshot attempt months
+  later is a bad time to find out.
+- 78 new unit cases in `tests/t_names.pl` (39 → 117) covering both DRP parameter sets,
+  the clone parameter builder, the feature-advertisement matrix, snapshot
+  scoping (including a name that matches while `volume_name` disagrees), the
+  rollback guard, `clone_image`'s error paths, `_pool_is_drp`'s memoisation
+  and its deliberate non-caching of failures, `alloc_image`'s one-REST-call
+  invariant on the thick path, and the snapshot-headroom warning boundary.
+  The `find_free_diskname` stub now records its arguments instead of
+  returning a constant — as a constant it made every clone naming assertion
+  pass regardless of what `clone_image` actually passed.
+
 ## Unreleased — 2026-08-31
 
 - **Resize verifies the host device instead of assuming it.**

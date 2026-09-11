@@ -49,7 +49,9 @@ sub ok_case {
 # ---- registered API surface -------------------------------------------------
 my $reg = PVE::RESTHandler::registered($M);
 ok_case('registered method set',
-    join(',', sort map { $_->{name} } @$reg), 'diridx,health,index,overview,performance');
+    join(',', sort map { $_->{name} } @$reg),
+    'diridx,health,index,overview,performance,snapshot_create,snapshot_delete,'
+    . 'snapshot_list,volume_from_snapshot');
 my ($health) = grep { $_->{name} eq 'health' } @$reg;
 ok_case('health exists', ($health ? 'yes' : 'no'), 'yes');
 # protected: the handler reads root-only /etc/pve/priv — must run in pvedaemon.
@@ -63,6 +65,51 @@ ok_case('performance is protected', ($perf && $perf->{protected} ? 1 : 0), 1);
 ok_case('performance path', ($perf && $perf->{path} // ''), '{storage}/performance');
 ok_case('performance has perm check',
     ($perf && $perf->{permissions} && $perf->{permissions}->{check} ? 'yes' : 'no'), 'yes');
+
+# ---- CSI snapshot surface: the WRITE endpoints -------------------------------
+# These four are what lets a Kubernetes CSI driver drive array snapshots
+# WITHOUT holding array credentials. Three properties are load-bearing and all
+# three are silent if they regress, so they are pinned here:
+#
+#   Datastore.Allocate, not Audit  — a reader must not be able to create or
+#       delete array objects. The reporting endpoints deliberately accept
+#       Audit; these must not.
+#   protected                      — the handler resolves the array credential
+#       from root-only /etc/pve/priv/storage/<id>.pw, which pveproxy's www-data
+#       cannot read. Without this the endpoint fails at runtime only.
+#   proxyto node                   — the array credential and the REST session
+#       live on the node, not on whichever node received the request.
+for my $c (
+    [ 'snapshot_list',        '{storage}/snapshot',             'GET',    0 ],
+    [ 'snapshot_create',      '{storage}/snapshot',             'POST',   1 ],
+    [ 'snapshot_delete',      '{storage}/snapshot',             'DELETE', 1 ],
+    [ 'volume_from_snapshot', '{storage}/volume-from-snapshot', 'POST',   1 ],
+) {
+    my ($name, $path, $method, $write) = @$c;
+    my ($m) = grep { $_->{name} eq $name } @$reg;
+    ok_case("$name exists",     ($m ? 'yes' : 'no'), 'yes');
+    ok_case("$name path",       ($m && $m->{path} // ''), $path);
+    ok_case("$name method",     ($m && $m->{method} // ''), $method);
+    ok_case("$name protected",  ($m && $m->{protected} ? 1 : 0), 1);
+    ok_case("$name proxyto",    ($m && $m->{proxyto} // ''), 'node');
+    my $perms = $m && $m->{permissions} && $m->{permissions}->{check};
+    ok_case("$name has perm check", ($perms ? 'yes' : 'no'), 'yes');
+    # The privilege list is the third element of ['perm', path, [privs], ...].
+    my $privs = $perms && ref($perms) eq 'ARRAY' ? $perms->[2] : undef;
+    my $has_audit = $privs && grep { $_ eq 'Datastore.Audit' } @$privs;
+    if ($write) {
+        ok_case("$name requires Allocate only",
+            ($privs && @$privs == 1 && $privs->[0] eq 'Datastore.Allocate') ? 'yes' : 'no', 'yes');
+        ok_case("$name rejects Audit", ($has_audit ? 'accepts' : 'rejects'), 'rejects');
+    } else {
+        ok_case("$name accepts Audit", ($has_audit ? 'yes' : 'no'), 'yes');
+    }
+}
+
+# The volume-from-snapshot path must NOT collide with the snapshot path, or
+# PVE's router would shadow one with the other.
+ok_case('snapshot paths are distinct',
+    (grep { ($_->{path} // '') eq '{storage}/volume-from-snapshot' } @$reg) ? 'yes' : 'no', 'yes');
 
 # ---- _whitelist --------------------------------------------------------------
 my $wl = PVE::API2::FlashSystem::_whitelist({ a => 1, b => undef, c => 3 }, qw(a b));
@@ -256,18 +303,18 @@ ok_case('num: fullwidth digits rejected',
     PVE::API2::FlashSystem::_num("\x{FF11}\x{FF12}"), undef);
 
 # ---- _stats_view (real lssystemstats row shape) -------------------------------
-my $sv = PVE::API2::FlashSystem::_stats_view([
+my $stv = PVE::API2::FlashSystem::_stats_view([
     { stat_name => 'cpu_pc',    stat_current => '5',  stat_peak => '9',  stat_peak_time => '260826104304' },
     { stat_name => 'vdisk_ms',  stat_current => '34', stat_peak => '52', stat_peak_time => '260826103954' },
     { stat_name => 'vdisk_io',  stat_current => '2070', stat_peak => '2276', stat_peak_time => '260826103904' },
     { stat_name => 'made_up_stat', stat_current => '1', stat_peak => '1' },
 ]);
-ok_case('stats: cpu current', $sv->{stats}{cpu_pc}{current}, 5);
-ok_case('stats: latency peak', $sv->{stats}{vdisk_ms}{peak}, 52);
-ok_case('stats: peak time kept', $sv->{stats}{vdisk_ms}{peak_time}, '260826103954');
+ok_case('stats: cpu current', $stv->{stats}{cpu_pc}{current}, 5);
+ok_case('stats: latency peak', $stv->{stats}{vdisk_ms}{peak}, 52);
+ok_case('stats: peak time kept', $stv->{stats}{vdisk_ms}{peak_time}, '260826103954');
 ok_case('stats: unknown stat dropped',
-    (exists $sv->{stats}{made_up_stat} ? 'yes' : 'no'), 'no');
-ok_case('stats: raw row count', $sv->{reported}, 4);
+    (exists $stv->{stats}{made_up_stat} ? 'yes' : 'no'), 'no');
+ok_case('stats: raw row count', $stv->{reported}, 4);
 
 # ---- _node_stats_view ---------------------------------------------------------
 # The point of per-node data is spotting ONE hot canister, so grouping by node
@@ -668,6 +715,81 @@ ok_case('events: total restored when filter ignored', $ignored->{unfixed_total},
     ok_case('peak: absent peak stays undef', $d->{stats}{vdisk_io}{peak}, undef);
 }
 
+
+# ---- the mutating CSI endpoints must hold the cluster storage lock ---------
+# Every write here is read-then-act. Storage Virtualize snapshot names are NOT
+# system-unique, so two concurrent CreateSnapshots for one CSI name both see
+# "absent" and both addsnapshot -- and csi_snapshot_delete can then only ever
+# remove the first, leaving the second holding physical capacity that
+# Kubernetes has no object for. external-snapshotter retries CreateSnapshot on
+# any error, including a read-back that timed out after addsnapshot took
+# effect, so this is a reachable race and not a theoretical one.
+{
+    local %PVE::Storage::CONFIG = (
+        'k8s-archive' => { type => 'flashsystem', fssnapshots => 1, shared => 1,
+                           fsprefix => 'k8sa', fspool => 'Pool3_Archive',
+                           fsrestore => 1 },
+    );
+    # Record what the handler asked the plugin to do, and whether it was
+    # holding the lock at the time.
+    my @calls;
+    no warnings 'redefine';
+    # NOT `local` inside the loop: local is scoped to the loop BODY, so each
+    # override would be restored before the handlers below ever run. Save and
+    # restore explicitly instead.
+    my @methods = qw(csi_snapshot_create csi_snapshot_delete csi_snapshot_list
+                     csi_volume_from_snapshot);
+    my %orig;
+    {
+        no strict 'refs';
+        for my $m (@methods) {
+            $orig{$m} = \&{"PVE::Storage::Custom::FlashSystemPlugin::$m"};
+            my $name = $m;
+            *{"PVE::Storage::Custom::FlashSystemPlugin::$m"} = sub {
+                push @calls, { method => $name, locked => ($PVE::Storage::LOCK_DEPTH > 0) };
+                return {};
+            };
+        }
+    }
+    my $by_name = {};
+    $by_name->{ $_->{name} } = $_ for @$reg;
+
+    for my $t ([ 'snapshot_create', 1, { storage => 'k8s-archive',
+                     volname => 'vm-9999-pvc-a', name => 'k10-snap-1' } ],
+               [ 'snapshot_delete', 1, { storage => 'k8s-archive',
+                     snapname => 'k8sa-vm-9999-pvc-a.3bcdefghi' } ],
+               [ 'volume_from_snapshot', 1, { storage => 'k8s-archive',
+                     snapname => 'k8sa-vm-9999-pvc-a.3bcdefghi', vmid => 4242 } ],
+               # The read endpoint deliberately does NOT lock: it mutates
+               # nothing, and taking a cluster lock on every reconciliation
+               # poll would serialise reads against every write on the storage.
+               [ 'snapshot_list', 0, { storage => 'k8s-archive' } ]) {
+        my ($name, $want_lock, $param) = @$t;
+        @calls = ();
+        local @PVE::Storage::LOCKS = ();
+        my $h = $by_name->{$name};
+        ok_case("$name: registered", ($h ? 'yes' : 'no'), 'yes');
+        next if !$h;
+        eval { $h->{code}->($param) };
+        ok_case("$name: handler ran", ($@ ? "died: $@" : 'ok'), 'ok');
+        ok_case("$name: reached the plugin", scalar(@calls), 1);
+        ok_case("$name: lock held during the call",
+            (@calls ? ($calls[0]{locked} ? 1 : 0) : -1), $want_lock);
+        ok_case("$name: locks taken", scalar(@PVE::Storage::LOCKS), $want_lock);
+        if ($want_lock) {
+            ok_case("$name: locks the right storage",
+                $PVE::Storage::LOCKS[0]{storeid}, 'k8s-archive');
+            # $shared must be passed through: with it false the lock is
+            # per-node, and the driver may reach any of the 12 nodes.
+            ok_case("$name: lock is cluster-wide",
+                ($PVE::Storage::LOCKS[0]{shared} ? 1 : 0), 1);
+        }
+    }
+    {
+        no strict 'refs';
+        *{"PVE::Storage::Custom::FlashSystemPlugin::$_"} = $orig{$_} for @methods;
+    }
+}
 
 print $fail ? "\n$fail FAILURE(S)\n" : "\nall api cases pass\n";
 exit($fail ? 1 : 0);

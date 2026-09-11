@@ -27,10 +27,13 @@ Proven operations: on-demand provisioning, online resize, live migration
 snapshots including RAM state, delete with array-side cleanup, cloud-init
 disks, Kubernetes CSI volumes.
 
-**Not supported:** templates / linked clones (no base-image support — keep
-template VMs on LVM or dir storage; full clones *onto* this storage work),
-snapshot-as-block-device, cross-VM volume reassignment via
+**Not supported:** templates and base-image linked clones (no COW support —
+keep template VMs on LVM or dir storage; full clones *onto* this storage
+work), snapshot-as-block-device, cross-VM volume reassignment via
 `qm disk move --target-vmid` (attach-by-volid works).
+
+**Clone from a snapshot** *is* implemented (array-side `mkvolume`, see
+`fsclonetype`) but has not yet been run against hardware.
 
 ### What that validation does and does not cover
 
@@ -45,7 +48,8 @@ error and can therefore look like a working panel with nothing in it.
 | Storage plugin (provision, resize, migrate, clone, snapshot, delete) | Production, 12 nodes, firmware 8.7 |
 | Health API + storage-view tab | Validated on a FlashSystem 5200 / 8.7.0.3 — all five sections returned content and every whitelisted field name matched |
 | Thin provisioning (`fsthin`) | Validated on a **standard** pool (5200 / 8.7.0.3): 100 GiB presented, 5 GiB real, autoexpand confirmed growing on write |
-| Thin provisioning on a **data reduction pool** | **Not validated.** DRPs apply their own rules to space-efficient volumes |
+| Thin provisioning on a **data reduction pool** | Diagnosed live (5200 / 8.7.0.3): a DRP rejects `-warning` only (`CMMVC9236E`), which the plugin now omits there. The corrected parameter set is **not yet re-run on hardware** |
+| Clone from snapshot (`clone_image`, `fsclonetype`) | **Not validated — `mkvolume` has never been issued against an array.** Run `tools/probe-clone-from-snapshot.sh` first |
 | Datacenter overview panel | **Unit coverage only** |
 | Performance endpoint (`lsnodestats`, `lssystemstats`, `lsthrottle`, `-history`) | **Unit coverage only** |
 | Per-volume consumption + `lssevdiskcopy` fill | **Unit coverage only** |
@@ -182,7 +186,8 @@ exactly.
 | `fshostgroup` | no | host cluster on the array |
 | `fsiogrp` | no | I/O group for new volumes (default `io_grp0`) |
 | `fssnapshots` | no | enable array snapshots (firmware ≥ 8.5.1) |
-| `fsthin` | no | thin-provision **new** volumes (`mkvdisk -rsize 2% -autoexpand -warning 80%`) |
+| `fsthin` | no | thin-provision **new** volumes (`mkvdisk -rsize 2% -autoexpand`; `-warning 80%` on standard pools only) |
+| `fsclonetype` | no | array volume type for clone-from-snapshot: `thinclone` (default) or `clone` |
 
 The standard PVE storage options `content`, `shared`, `nodes` and `disable`
 are accepted as usual; set `--shared 1` (host-cluster-mapped volumes are
@@ -213,20 +218,80 @@ or touch anything outside their own prefix. Rules that follow:
 
 Bare `mkvdisk` creates **fully allocated** volumes — the full provisioned
 size is reserved at creation, and in a data reduction pool that also bypasses
-thin/dedup. `fsthin 1` switches new volumes to `-rsize 2% -autoexpand
--warning 80%`, which behaves the same on standard pools and DRPs.
+thin/dedup. `fsthin 1` switches new volumes to `-rsize 2% -autoexpand`, plus
+`-warning 80%` on a standard pool only.
 
 Validated on a standard pool (FlashSystem 5200, firmware 8.7.0.3): a 100 GiB
 volume created with 5 GiB real capacity, reported as *Thin-provisioned* at an
 80% warning threshold, with real capacity growing ahead of the data on write.
-**Not yet validated on a data reduction pool** — DRPs apply their own rules
-to space-efficient volumes, so test on a scratch DRP first if that is where
-you intend to use it.
+
+**On a data reduction pool the parameter set differs by one flag.** A DRP
+rejects `-warning` on a thin volume (`CMMVC9236E`) — *parameter validation*,
+not a capacity check, so it fails on an empty pool too and "we are over 80%"
+is the wrong inference. The plugin detects the pool type and omits it.
+`-rsize` is still sent even though a DRP ignores its value (only presence
+decides thin vs thick — dropping it would silently produce **thick**
+volumes), and `-autoexpand` turns out to be *required* there.
+
+Two DRP consequences worth knowing first: a DRP thin volume has **no
+per-volume capacity warning at all** — by design, IBM handle capacity
+reporting at the pool layer — and `lssevdiskcopy` returns blank capacity
+fields for space-efficient copies in a DRP, so per-volume fill is
+unavailable too. Pool-layer alerting is the whole story, not a backstop.
 
 Thin means **overcommit**: a pool driven to physical-full takes every volume
-in it offline. Have array-side physical-free alerting in place before
-enabling it on pools shared with other workloads. Existing volumes keep their
-allocation; convert online array-side with `addvdiskcopy -autodelete`.
+in it offline, and a DRP in that state needs IBM Support rather than a
+self-service fix. Have array-side physical-free alerting in place before
+enabling it on pools shared with other workloads. `fsthin 0` is **not** a
+rollback — it affects new volumes only; convert existing ones online
+array-side with `addvdiskcopy -autodelete`.
+
+### Clone from snapshot (`fsclonetype`) — implemented, not yet validated
+
+With `fssnapshots 1` **and `fsrestore 1`** the plugin advertises PVE's `clone`
+feature **from a snapshot**, and implements it array-side:
+
+```sh
+pvesm set <storage> --fsrestore 1          # only after the probe passes
+qm snapshot 101 s1
+qm clone 101 102 --snapshot s1 --full 0    # array-side mkvolume; PVE copies nothing
+```
+
+Both flags, not just `fssnapshots`. This is `mkvolume`, the same unvalidated
+command family the CSI restore path uses, so it sits behind the same gate —
+and `volume_has_feature` stops advertising `clone` while that gate is closed,
+so PVE refuses the operation itself rather than offering it and failing inside
+the plugin. Earlier revisions gated only the CSI entry point, which left this
+command issuing `mkvolume` with `fsrestore` at its default.
+
+Population is `mkvolume -type thinclone|clone -fromsourcevolume …
+-fromsnapshotid … -name …`. Because `-name` is ours to choose, the new volume
+gets a conforming PVE volname and `list_images` surfaces it with nothing else
+to update.
+
+`fsclonetype` picks the trade:
+
+| Value | Behaviour |
+|---|---|
+| `thinclone` *(default)* | Instant, near-zero capacity, **permanently dependent** on the source snapshot — deleting that snapshot is deferred, not freed. |
+| `clone` | Independent once a background copy finishes, at IBM's default 2 MB/s — hours per 100 GiB. |
+
+Base images and templates remain **unsupported**: `clone` is advertised only
+*with* a snapshot, because there is no COW layer here.
+
+> **`mkvolume` has never been issued against this array.** It is the one
+> command family the plugin had not used, and the `-warning` rejection above
+> is what "documented as unrestricted" is worth. Run
+> `tools/probe-clone-from-snapshot.sh` on a scratch volume in your slackest
+> pool first: it answers whether the snapshot form works on a loose volume,
+> what a thinclone does to `rmsnapshot`, whether `rmvdisk` succeeds with
+> snapshots present, and whether `restorefromsnapshot` changes `vdisk_UID`.
+
+Rollback is guarded. `volume_rollback_is_possible` refuses a volume that has
+been **resized since the snapshot was taken**, because the array requires the
+same virtual capacity and would otherwise fail with an opaque CMMVC — which
+also means an ordinary volume expansion invalidates rollback for every
+snapshot that volume already had.
 
 ## Operational behavior worth knowing
 

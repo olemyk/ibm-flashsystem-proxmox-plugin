@@ -1,0 +1,51 @@
+# VolumeSnapshotClass for FlashSystem array snapshots.
+#
+# The upstream chart ships no VolumeSnapshotClass at all (check
+# charts/proxmox-csi-plugin/templates/ — there is none), so this has to be
+# applied separately. Without it, a VolumeSnapshot has nothing to bind to and
+# reports no useful reason.
+#
+#   kubectl apply -f volumesnapshotclass.yaml
+#
+# PREREQUISITE: the snapshot CRDs and the snapshot-controller must already be
+# installed in the cluster. They are NOT part of any CSI driver — they are a
+# separate component, and on a cluster that has never taken a snapshot they
+# will be missing. Check before anything else:
+#
+#   kubectl get crd volumesnapshots.snapshot.storage.k8s.io
+#   kubectl -n kube-system get deploy snapshot-controller
+#
+# If either is absent, install external-snapshotter's CRDs and controller
+# first (client/config/crd and deploy/kubernetes/snapshot-controller from
+# kubernetes-csi/external-snapshotter, matching the sidecar version — v8.3.0
+# in values-flashsystem.yaml).
+
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: proxmox-flashsystem
+  # Deliberately NOT annotated as the default class.
+  #
+  # Default selection is the one place the snapshot-controller DOES match on
+  # driver name (snapshot_controller.go, IsVolumeSnapshotClassDefaultAnnotation
+  # compared against the PV's driver), so a default class here would be
+  # selected only for volumes provisioned by this same driver — which is
+  # correct but easy to misread as "all snapshots go to the array". Name the
+  # class explicitly on every VolumeSnapshot instead.
+  #
+  # annotations:
+  #   snapshot.storage.k8s.io/is-default-class: "true"
+driver: csi.proxmox.sinextra.dev
+
+# Delete removes the array snapshot when the VolumeSnapshot goes away.
+#
+# Worth understanding before changing it: with `thinclone` as the storage's
+# fsclonetype (the default), a restored volume stays DEPENDENT on its source
+# snapshot for its whole life. Deleting that snapshot is then deferred by the
+# array into a dependent_deleting state rather than freeing space — so
+# Delete does not necessarily reclaim capacity while a restore is still alive.
+#
+# Retain leaves the array snapshot behind for a human to remove, which trades
+# a capacity leak for an accidental-deletion guard. On a data reduction pool
+# already at 78-80% physical, prefer Delete and reconcile.
+deletionPolicy: Delete
