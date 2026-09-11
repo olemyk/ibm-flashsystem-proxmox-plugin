@@ -74,6 +74,17 @@ Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
   the driver — and that shortcut is the only place readiness is decided on that
   path. Upstream's `TestControllerServiceControllerGetCapabilities` pins the
   capability count, so the patch bumps 9 → 10 in `controller_test.go`.
+- **The suite could not run on a bare perl**, which is what a CI runner is.
+  `run.sh` claims it "runs anywhere perl exists", but the module's `use JSON`,
+  `use LWP::UserAgent` and `use HTTP::Request` are non-core — installed on every
+  node by `flashsystem_plugin_packages`, absent on a runner — and `use` runs at
+  BEGIN, so `perl -T -I stub -c`, the FIRST command in the suite, died before a
+  single case ran. All three are now shimmed in `tests/stub`, JSON delegating to
+  core `JSON::PP` so booleans and round-tripping stay real rather than faked.
+  The `LWP::UserAgent` shim's `request` is deliberately fatal: a plausible fake
+  response would let a test assert against fiction. Since `stub` is first on
+  `@INC` the shims win everywhere, so the suite now behaves identically on a
+  laptop and on the runner.
 - **`tools/probe-clone-from-snapshot.sh` could not run at all.** `fs()`
   assigned `FS_HTTP` inside the command substitution every one of its ~29 call
   sites wraps it in, so the parent's copy stayed empty for the whole run:
