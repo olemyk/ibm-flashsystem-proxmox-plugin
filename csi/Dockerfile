@@ -21,7 +21,19 @@ ARG UPSTREAM_REPO=https://github.com/sergelogvinov/proxmox-csi-plugin.git
 # safety argument rests on the patch applying to code that has been read.
 ARG UPSTREAM_COMMIT=a7aacee7a2144a43be08503068fe0b9caf3d0b4e
 
-FROM golang:1.26.5-alpine3.24 AS builder
+# --platform=$BUILDPLATFORM: run the builder NATIVELY on whoever is building,
+# and cross-compile from there. The final binary's arch comes from
+# GOARCH=${TARGETARCH} below, so the artifact is identical either way — but
+# without this, buildx pulls the TARGET-arch golang image and emulates the
+# whole stage under QEMU, upstream's test suite included. On an arm64 laptop
+# building for linux/amd64 that is the difference between a couple of minutes
+# and a very long coffee. CGO_ENABLED=0 is what makes the cross-compile need
+# no toolchain.
+#
+# Note the tests at the end of this stage therefore run on the BUILD arch.
+# That is fine here and arguably better: they are pure-Go logic tests, and
+# `make verify` runs them natively too.
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.24 AS builder
 
 RUN apk add --no-cache git
 WORKDIR /src

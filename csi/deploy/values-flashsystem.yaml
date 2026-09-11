@@ -60,6 +60,34 @@
 # then install with neither --create-namespace nor createNamespace.
 createNamespace: false
 
+# ── private registry ───────────────────────────────────────────────────────
+# TOP LEVEL, not under `controller`. The chart reads `.Values.imagePullSecrets`
+# globally (values.yaml line 7) and applies it to both the controller and the
+# node pod. Nesting it under `controller:` renders NOTHING and reports no
+# error — the same silent-miss shape as controller.plugin.image. Verify after
+# templating:
+#   helm template ... | grep -A2 imagePullSecrets
+#
+# Harbor is private, so the controller cannot pull without this, and its
+# absence is quiet in a familiar way: the Deployment sits in ImagePullBackOff
+# and PVCs stay Pending, with the real reason only in the pod's events —
+# nothing in the CSI logs says "I never started".
+#
+# Create it with a Harbor ROBOT account scoped to pull on the
+# ibm-flash-storage-csi project, not a personal login: a robot token is
+# revocable without locking anyone out and carries no push rights.
+#
+#   kubectl -n csi-proxmox create secret docker-registry harbor \
+#     --docker-server=harbor.vmcloud.no \
+#     --docker-username='robot$ibm-flash-storage-csi+k8s' \
+#     --docker-password='<token>'
+#
+# Single-quote the username. Harbor robot names contain a `$`, which the shell
+# would expand to nothing, and the secret then authenticates as an empty user
+# and fails with a 401 that reads exactly like a wrong password.
+imagePullSecrets:
+  - name: harbor
+
 controller:
   # ── the fork ─────────────────────────────────────────────────────────────
   # Set this to whatever `make push REGISTRY=...` produced. The tag encodes
@@ -74,11 +102,14 @@ controller:
   #   helm template ... | grep proxmox-csi-flashsystem
   plugin:
     image:
-      repository: REPLACE-ME/proxmox-csi-flashsystem-controller
+      # harbor.vmcloud.no project `ibm-flash-storage-csi`; the repository
+      # inside it is created by the first `make push`.
+      repository: harbor.vmcloud.no/ibm-flash-storage-csi/proxmox-csi-flashsystem-controller
       # Empty tag defaults to .Chart.AppVersion, which would be upstream's.
       # Always set it explicitly.
       tag: v0.20.0-fs1
       pullPolicy: IfNotPresent
+
 
   # ── the snapshotter sidecar ──────────────────────────────────────────────
   # OFF by default upstream, and its absence is silent in the worst way: the
