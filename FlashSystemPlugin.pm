@@ -36,6 +36,7 @@ use strict;
 use warnings;
 
 use Digest::SHA qw(sha256);
+use POSIX ();
 use JSON qw(encode_json decode_json);
 use LWP::UserAgent;
 use HTTP::Request;
@@ -315,19 +316,104 @@ sub _wwid {
 
 # ---- Host mapping (tolerant / idempotent) --------------------------------
 
+# Rows from lsvdiskhostmap, normalised.
+#
+# lsvdiskhostmap, and ONLY lsvdiskhostmap: it is the one we have watched work.
+# A host-CLUSTER mapping renders there as one row per member host, so a
+# correctly mapped volume on pmcl01 returns twelve (observed 2026-09-14).
+#
+# An earlier cut of this read-back used lsvolumehostclustermap. Against this
+# array it returned something that was not a list of rows - what exactly was
+# never established, and is NOT recorded here as "the command does not exist",
+# because that was an inference from a parser crash and nothing more. Had it
+# shipped, every map error would have died with "could not be read back",
+# which is worse than the bug it replaced.
+#
+# The rule this file keeps relearning: build only on array behaviour that has
+# been observed, and write down what was observed rather than what it implies.
+sub _hostmap_rows {
+    my ($scfg, $volname, $storeid) = @_;
+    my $rows = _cmd($scfg, 'lsvdiskhostmap', _arrayname($scfg, $volname),
+        {}, storeid => $storeid);
+    $rows = [] if !defined $rows;
+    $rows = [ $rows ] if ref($rows) eq 'HASH';
+    return [] if ref($rows) ne 'ARRAY';
+    return [ grep { ref($_) eq 'HASH' } @$rows ];
+}
+
+# Host names as the ARRAY knows them, for diagnostics only. Deliberately never
+# used to decide anything: the array's host names match the PVE node names on
+# this fleet by convention, not by guarantee, and a convention must not be able
+# to fail an attach.
+sub _hostmap_names {
+    my ($rows) = @_;
+    my @n = grep { defined && length } map { $_->{host_name} } @$rows;
+    return @n ? join(',', @n) : '(none reported)';
+}
+
 sub _map_volume {
     my ($scfg, $volname, $storeid) = @_;
-    eval { _cmd($scfg, 'mkvolumehostclustermap', _arrayname($scfg, $volname), { hostcluster => $scfg->{fshostgroup} }, storeid => $storeid); };
-    if (my $err = $@) {
-        # already mapped is fine; anything else is real. The cluster-wide
-        # mapping is created once and kept (until free_image), so every
-        # re-activation after the first hits "already has a shared mapping":
-        #   CMMVC9066E — volume already has a shared mapping to the host cluster
-        # host-level "already mapped" codes are kept too, in case a firmware
-        # reports the host-cluster case with one of them.
-        die $err unless $err =~ /already mapped|already has a shared mapping|CMMVC9066E|CMMVC6071E|CMMVC5879E|CMMVC6070E/i;
+    my $aname = _arrayname($scfg, $volname);
+    eval { _cmd($scfg, 'mkvolumehostclustermap', $aname,
+        { hostcluster => $scfg->{fshostgroup} }, storeid => $storeid); };
+    my $err = $@;
+    return 1 if !$err;    # happy path: no read-back, no extra REST call
+
+    # The old code matched the error text against a list of "already mapped"
+    # codes and called anything matching a success. Three of those codes -
+    # CMMVC6071E, CMMVC5879E, CMMVC6070E - are HOST-level, included on the guess
+    # that "a firmware might report the host-cluster case with one of them".
+    # A volume already mapped to an INDIVIDUAL host reports exactly those, and
+    # that is a refusal, not a success: the LUN then reaches that one host and
+    # no other, while every other node fails to attach with a message implying
+    # a mapping happened.
+    #
+    # This is what happened on 2026-09-14, and the chain matters because the
+    # obvious reading of it is wrong:
+    #
+    #   * the k8s node needing the volume (nosvgvik8sctrl03) runs on
+    #     nosvgsmpm007, so activate_volume ran there - the right node.
+    #   * the LUN had 8 paths on nosvgsmpm003, which hosts a DIFFERENT k8s node
+    #     (ctrl02) and is a plausible home for the clone's source volume.
+    #   * "8 paths on one node, none on eleven" does NOT by itself prove a
+    #     host-scoped mapping, because only the node running activate_volume
+    #     rescans - a correct cluster mapping looks the same until the others
+    #     look. That reading was withdrawn once, correctly.
+    #   * what settles it: nosvgsmpm007 looked exhaustively and found nothing -
+    #     rescan-scsi-bus.sh -a -r, then -a -r -u, then a full wildcard
+    #     "- - -" scan of every target and LUN, then a grep of every
+    #     sd*/device/wwid. A host-CLUSTER mapping presents to all twelve at
+    #     once, so 003 could not hold it while 007 searched that hard and came
+    #     back empty.
+    #
+    # Host-scoped, therefore - exactly what a swallowed CMMVC6071E produces.
+    # Asking what is true instead of parsing why the array said no is also
+    # correct idempotency: an existing mapping reads as mapped regardless of
+    # which code the firmware chose to report.
+    my $rows = eval { _hostmap_rows($scfg, $volname, $storeid) };
+    my $read_err = $@;
+
+    # An unreadable array must not be read as "mapped" - but it must not be
+    # read as "unmapped" either. Report both failures and let the caller's
+    # device poll be the arbiter.
+    if ($read_err) {
+        warn "flashsystem: could not read back the host mapping for '$aname'"
+            . " after a failed map; proceeding to the device poll.\n"
+            . "  map: $err  read-back: $read_err";
+        return 1;
     }
-    return 1;
+
+    # Rows present means SOMETHING is mapped. Deliberately not asserting that
+    # this node is among them: the check would rest on array host names
+    # matching PVE node names, and a naming convention must never be able to
+    # fail an attach. activate_volume's device poll decides, and its failure
+    # message carries this mapping so the answer is one read away.
+    return 1 if @$rows;
+
+    die "flashsystem: '$aname' is not mapped to anything. The host-cluster map"
+        . " to '" . ($scfg->{fshostgroup} // '') . "' was refused and the array"
+        . " reports no mapping of any kind, so no node can see this volume.\n"
+        . "  array said: $err";
 }
 
 sub _unmap_volume {
@@ -343,14 +429,26 @@ sub _unmap_volume {
 # ---- Host-side block device plumbing ------------------------------------
 
 sub _rescan_scsi {
-    # Prefer sg3-utils. Pass -r (remove) alongside -a (add) so a LUN whose
-    # identity changed -- a reused LUN slot, or a volume whose vdisk_UID differs
-    # after a rollback -- is pruned and rediscovered, instead of leaving a stale
-    # device that masks the new wwid (multipath would assemble the OLD map and
-    # the expected /dev/mapper/3<UID> never appears). -a alone cannot refresh a
-    # changed LUN. This is what makes cross-node reattach self-heal.
+    # Prefer sg3-utils. Three flags, and each covers a case the others miss:
+    #   -a  add new LUNs
+    #   -r  remove LUNs the array no longer reports at all
+    #   -u  "look for existing disks that have been remapped" (its own --help)
+    #
+    # -u is included on the documented semantics, NOT on evidence that it fixes
+    # anything here. -r only removes a LUN the array has stopped reporting; when
+    # the array RECYCLES a LUN number to a different volume - plausible once
+    # Kubernetes churns PVCs - that slot still reports something, so it is
+    # neither new nor removed, and -a -r would leave a stale device that makes
+    # multipath assemble the OLD map.
+    #
+    # Honesty about 2026-09-14: `-a -r -u` was tried against the failing attach
+    # on nosvgsmpm007 and did NOT resolve it (14s, "0 device(s) removed", device
+    # still absent). The actual failure there was a mapping that never reached
+    # this node, which no rescan can fix. -u stays because a remapped LUN is a
+    # real case and this is the documented flag for it - but if attach latency
+    # ever matters, drop it: the tests pin the flag set either way.
     if (run_command([ 'sh', '-c', 'command -v rescan-scsi-bus.sh >/dev/null 2>&1' ], noerr => 1) == 0) {
-        run_command([ 'rescan-scsi-bus.sh', '-a', '-r' ], noerr => 1);
+        run_command([ 'rescan-scsi-bus.sh', '-a', '-r', '-u' ], noerr => 1);
     } else {
         run_command([ 'sh', '-c', 'for h in /sys/class/scsi_host/host*/scan; do echo "- - -" > "$h"; done' ], noerr => 1);
     }
@@ -1096,6 +1194,16 @@ sub activate_volume {
         select(undef, undef, undef, 0.5);
     }
     if (!-e $dev) {
+        # Name the mapping in the failure. "did not appear after mapping"
+        # implies a mapping happened and says nothing about WHERE - which cost
+        # a long afternoon on 2026-09-14, when the volume was mapped to exactly
+        # one host and the node waiting for it was a different one.
+        my $rows = eval { _hostmap_rows($scfg, $volname, $storeid) } // [];
+        my $where = @$rows
+            ? scalar(@$rows) . " host(s): " . _hostmap_names($rows)
+            : "NOTHING - the array reports no host mapping for this volume";
+        warn "flashsystem: '$volname' is mapped to $where; this node is "
+            . (eval { (POSIX::uname())[1] } // '?') . ".\n";
         # Failure-safe: don't leave a half-mapped orphan behind. With
         # queue_if_no_path, a mapped-but-pathless LUN makes host LVM scans
         # (vgs) hang - which is how a failed migrate wedged nodes before. Flush

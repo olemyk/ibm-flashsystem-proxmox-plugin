@@ -52,6 +52,24 @@ Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
   volume's contents *without deleting any object*, so it trips no capacity or
   object-count monitoring. An unknown or absent state refuses, like the
   `volume_size_mismatch` guard beside it.
+- **`_map_volume` swallowed a refusal as a success.** It matched the array's
+  error text against a list of "already mapped" codes, three of which -
+  `CMMVC6071E`, `CMMVC5879E`, `CMMVC6070E` - are HOST-level, included on the
+  guess that "a firmware might report the host-cluster case with one of them".
+  A volume already mapped to an INDIVIDUAL host reports exactly those, and that
+  is a refusal: the LUN reaches that one host and no other, while every other
+  node fails to attach with a message implying a mapping happened. The regex is
+  gone entirely - not narrowed - and replaced by a read-back of
+  `lsvdiskhostmap`, so idempotency is decided by what IS rather than by which
+  code a firmware chose. The happy path costs no extra REST call; an unreadable
+  read-back warns and defers to the device poll rather than becoming a hard
+  attach failure.
+  `activate_volume`'s failure now names the mapping - *"mapped to 1 host(s):
+  nosvgsmpm003; this node is nosvgsmpm007"* instead of "did not appear after
+  mapping", which implies a mapping happened and says nothing about where.
+  NOTE: this makes the failure legible; it does not remove an inherited
+  mapping, so a clone in that state still fails to attach - by design, until
+  the array confirms the cause.
 - **The array reports "no such object" as an ERROR, and the restore path read
   that as "cannot verify".** `csi_volume_from_snapshot` checks whether the
   caller's chosen volume name is already taken before `mkvolume`. Storage

@@ -612,6 +612,138 @@ ok_case('feature copy from snap',   $P->volume_has_feature($fs_on,  'copy', 'S',
     }
 }
 
+# ---- _map_volume: verify the mapping, never parse why the array said no ----
+# The old swallow list treated HOST-level "already mapped" codes (CMMVC6071E,
+# CMMVC5879E, CMMVC6070E) as a successful host-CLUSTER map, on a guess. That
+# turns a refusal into a success: the LUN reaches one host and no other, and
+# every other node then fails to attach with a message implying a mapping
+# happened. 2026-09-14: 8 paths on nosvgsmpm003, zero on the other eleven.
+#
+# The read-back uses lsvdiskhostmap, where a host-CLUSTER mapping renders as
+# one row per member host (twelve, observed). An earlier cut of this fix used
+# lsvolumehostclustermap, which this firmware does not appear to have at all -
+# it would have failed EVERY map error. Hence: only commands seen working.
+{
+    my $sc = { fsprefix => 'k8ss', fshostgroup => 'pmcl01' };
+    no warnings 'redefine';
+    my $MV = $P->can('_map_volume');
+    local $SIG{__WARN__} = sub { };
+
+    # Clean map: no read-back, so the happy path stays at one REST call.
+    my @sent;
+    local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+        my (undef, $command) = @_; push @sent, $command; return {};
+    };
+    ok_case('map: clean map returns',     $MV->($sc, 'vm-1-disk-0', 'S'), 1);
+    ok_case('map: happy path is one call', scalar(@sent), 1);
+    ok_case('map: and it is the map call', $sent[0], 'mkvolumehostclustermap');
+
+    # Refused but genuinely mapped -> success, whatever code was reported.
+    # Idempotency by FACT, not by regex - including the host-level codes the
+    # old list swallowed and the wordings no list would have anticipated.
+    for my $code ('CMMVC9066E already has a shared mapping',
+                  'CMMVC6071E already mapped to a host',
+                  'CMMVC5879E some wording nobody enumerated') {
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my (undef, $command) = @_;
+            die "flashsystem: mkvolumehostclustermap failed: 409 $code\n"
+                if $command eq 'mkvolumehostclustermap';
+            return [ map { { host_name => "nosvgsmpm$_" } } qw(000 001 002) ]
+                if $command eq 'lsvdiskhostmap';
+            return [];
+        };
+        ok_case("map: refused but mapped ($code)",
+            (eval { $MV->($sc, 'vm-1-disk-0', 'S') } // "died: $@"), 1);
+    }
+
+    # THE BUG: refused, and nothing is mapped. Used to return success.
+    {
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my (undef, $command) = @_;
+            die "flashsystem: mkvolumehostclustermap failed: 409 CMMVC6071E\n"
+                if $command eq 'mkvolumehostclustermap';
+            return [] if $command eq 'lsvdiskhostmap';
+            return [];
+        };
+        eval { $MV->($sc, 'vm-1-disk-0', 'S') };
+        ok_case('map: refused + nothing mapped DIES',
+            ($@ && $@ =~ /not mapped to anything/) ? 'dies' : "(!? $@)", 'dies');
+        ok_case('map: the failure quotes the array',
+            ($@ && $@ =~ /CMMVC6071E/) ? 'yes' : 'no', 'yes');
+    }
+
+    # Auth failure with nothing mapped must also die.
+    {
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my (undef, $command) = @_;
+            die "flashsystem: mkvolumehostclustermap failed: 401 Unauthorized\n"
+                if $command eq 'mkvolumehostclustermap';
+            return [];
+        };
+        eval { $MV->($sc, 'vm-1-disk-0', 'S') };
+        ok_case('map: auth failure dies',
+            ($@ && $@ =~ /not mapped to anything/) ? 'dies' : "(!? $@)", 'dies');
+    }
+
+    # An UNREADABLE read-back must neither assert mapped nor unmapped: warn and
+    # let activate_volume's device poll arbitrate. Dying here would make a
+    # throttled array a hard attach failure.
+    {
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my (undef, $command) = @_;
+            die "flashsystem: mkvolumehostclustermap failed: 409 CMMVC6071E\n"
+                if $command eq 'mkvolumehostclustermap';
+            die "flashsystem: lsvdiskhostmap failed: 429 Too Many Requests\n";
+        };
+        my $warned = 0;
+        local $SIG{__WARN__} = sub { $warned++ if $_[0] =~ /could not read back/ };
+        ok_case('map: unreadable read-back proceeds',
+            (eval { $MV->($sc, 'vm-1-disk-0', 'S') } // "died: $@"), 1);
+        ok_case('map: and says so',  $warned, 1);
+    }
+
+    # Shape tolerance, same as everywhere else in this file: a bare hash and a
+    # junk row must not be read as "nothing is mapped".
+    {
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my (undef, $command) = @_;
+            die "flashsystem: mkvolumehostclustermap failed: 409 CMMVC6071E\n"
+                if $command eq 'mkvolumehostclustermap';
+            return { host_name => 'nosvgsmpm000' } if $command eq 'lsvdiskhostmap';
+            return [];
+        };
+        ok_case('map: bare hash row counts as mapped',
+            (eval { $MV->($sc, 'vm-1-disk-0', 'S') } // "died: $@"), 1);
+    }
+}
+
+# ---- the SCSI rescan flags ------------------------------------------------
+# -a -r -u, and each covers a case the others miss. -u is the one that took a
+# live failure to learn: -r only removes a LUN the array has stopped reporting,
+# so when the array RECYCLES a LUN number to a different volume - constant once
+# Kubernetes churns PVCs - the slot is neither new nor removed, -a -r leaves the
+# stale device, multipath assembles the OLD map and /dev/mapper/3<UID> never
+# appears. Nothing pinned these flags before nosvgsmpm007 failed to attach.
+{
+    local @PVE::Tools::CALLS = ();
+    $P->can('_rescan_scsi')->();
+    my ($rescan) = grep { $_->[0] eq 'rescan-scsi-bus.sh' } @PVE::Tools::CALLS;
+    ok_case('rescan: uses rescan-scsi-bus.sh', ($rescan ? 'yes' : 'no'), 'yes');
+    if ($rescan) {
+        my %f = map { $_ => 1 } @$rescan;
+        ok_case('rescan: -a (add new LUNs)',            ($f{'-a'} ? 1 : 0), 1);
+        ok_case('rescan: -r (drop vanished LUNs)',      ($f{'-r'} ? 1 : 0), 1);
+        ok_case('rescan: -u (catch REMAPPED LUNs)',     ($f{'-u'} ? 1 : 0), 1);
+    }
+    # The no-sg3-utils fallback must still scan, or a node without the package
+    # silently stops discovering anything.
+    local %PVE::Tools::RC = ( 'sh' => 1 );   # `command -v rescan-scsi-bus.sh` fails
+    local @PVE::Tools::CALLS = ();
+    $P->can('_rescan_scsi')->();
+    my $fellback = grep { ($_->[-1] // '') =~ m{/sys/class/scsi_host} } @PVE::Tools::CALLS;
+    ok_case('rescan: falls back to a sysfs scan', ($fellback ? 'yes' : 'no'), 'yes');
+}
+
 # ---- _pool_is_drp + alloc_image threading ---------------------------------
 # The one line that actually chooses the parameter set on a production array
 # is alloc_image's `my $drp = $scfg->{fsthin} ? _pool_is_drp(...) : 0`, and
