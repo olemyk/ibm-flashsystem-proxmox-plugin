@@ -52,6 +52,21 @@ Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
   volume's contents *without deleting any object*, so it trips no capacity or
   object-count monitoring. An unknown or absent state refuses, like the
   `volume_size_mismatch` guard beside it.
+- **The array reports "no such object" as an ERROR, and the restore path read
+  that as "cannot verify".** `csi_volume_from_snapshot` checks whether the
+  caller's chosen volume name is already taken before `mkvolume`. Storage
+  Virtualize answers a missing object with **409 + CMMVC5754E**, not an empty
+  2xx body, so `_cmd` died and `_vdisk` never reached its own not-found die -
+  and the fail-closed guard, which matched only `/not found/`, turned the one
+  reply meaning *this name is free* into a refusal. Every K10 restore and
+  export failed, because K10 mints the PV name before asking for the clone.
+  Now `CMMVC5754E` counts as absence while everything else still fails closed:
+  unreachable array, 401/403, exhausted 429 backoff and unparseable JSON must
+  never read as "free to use". Eight regression cases pin both directions.
+  `tools/probe-clone-from-snapshot.sh` gained assertion **A**, which records
+  the raw status and body for an absent object, so the contract this now
+  depends on is evidence rather than assumption - the probe's own
+  `vol_exists()` had always handled it correctly and the plugin had not.
 - **`PVE::Storage::cluster_lock_storage` does not exist.** The lock below was
   added calling it, and it got through because `tests/stub/PVE/Storage.pm`
   *defined* the invented function — so 213 API cases validated an API PVE has

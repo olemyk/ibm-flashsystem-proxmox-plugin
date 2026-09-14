@@ -1948,8 +1948,27 @@ sub csi_volume_from_snapshot {
         # not-found die may be treated as absence.
         my $clash = eval { _vdisk($scfg, $name, $storeid) };
         my $err = $@;
+        # Storage Virtualize signals "no such object" as an ERROR STATUS -
+        # 409 Conflict with CMMVC5754E - not as an empty 2xx body. _cmd dies on
+        # every non-2xx, so _vdisk NEVER reaches its own "not found" die for the
+        # absent case, and matching only /not found/ turned the one answer that
+        # means "this name is free" into a refusal. That broke every K10 restore
+        # and export, because K10 clones a snapshot into a name it has already
+        # minted and embedded in the PV. tools/probe-clone-from-snapshot.sh got
+        # this right in vol_exists() and the plugin did not.
+        #
+        # Still fail CLOSED for everything else. An unreachable array, a 401/403,
+        # an exhausted 429 backoff or unparseable JSON must not read as absence,
+        # or mkvolume runs over a name that may already be in use.
+        #
+        # CMMVC5754E also covers "the name supplied does not meet the naming
+        # rules". Treating that as absent is deliberate and safe: parse_volname
+        # and the 63-char gate have both already run, so a genuinely illegal
+        # name fails at mkvolume with the array's own error rather than with a
+        # misleading "cannot verify".
+        my $absent = defined($err) && $err =~ /CMMVC5754E|\bnot found\b/i;
         die "flashsystem: cannot verify whether '$name' already exists on"
-            . " '$storeid': $err" if !$clash && $err && $err !~ /not found/;
+            . " '$storeid': $err" if !$clash && $err && !$absent;
         die "flashsystem: volume '$name' already exists on '$storeid'\n" if $clash;
     } else {
         my $vmid = $opt{vmid};

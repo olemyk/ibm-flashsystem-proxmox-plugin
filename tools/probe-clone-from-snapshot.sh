@@ -365,6 +365,33 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ══════════════════════════════════════════════════════════════════════════
+step "A. The not-found contract the plugin now depends on"
+# csi_volume_from_snapshot asks the array whether the CALLER'S chosen volume
+# name is already taken, before mkvolume. Storage Virtualize answers a missing
+# object with an ERROR STATUS carrying CMMVC5754E, not an empty 2xx body - and
+# an earlier cut of the plugin treated every non-2xx as "cannot verify" and
+# aborted. That refused every restore into a fresh name, which is what
+# Kubernetes always does: K10 mints the PV name before it asks for the clone.
+#
+# So pin the contract here rather than assuming it. If a future firmware
+# answers differently, this assertion is what tells you before a restore does.
+NOPE="${SRC_ANAME}-does-not-exist"
+NF="$(fs lsvdisk "$NOPE" '{"bytes":true}')"
+NF_H="$(fs_http)"
+say "lsvdisk <absent>   [HTTP $NF_H]"
+say "raw: $NF"
+if fs_ok; then
+    inconc "A  lsvdisk on a missing object returned 2xx - the plugin expects a"
+    inconc "   non-2xx with CMMVC5754E. Check csi_volume_from_snapshot's"
+    inconc "   existence check still reads this correctly."
+elif printf '%s' "$NF" | grep -q 'CMMVC5754E'; then
+    good "A  absent object -> HTTP $NF_H + CMMVC5754E, as the plugin expects"
+else
+    bad "A  absent object -> HTTP $NF_H but NO CMMVC5754E. The plugin treats"
+    bad "   only CMMVC5754E (and its own 'not found') as absence and fails"
+    bad "   CLOSED otherwise, so every restore into a fresh name will refuse."
+fi
+
 step "0. Baseline — pool state, and the capacity guard"
 BASE="$(fs lsmdiskgrp "$POOL" '{"bytes":true}')"
 fs_ok || die "lsmdiskgrp failed (HTTP $(fs_http)): $BASE"

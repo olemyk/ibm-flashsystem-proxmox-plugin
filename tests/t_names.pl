@@ -1044,6 +1044,62 @@ ok_case('feature copy from snap',   $P->volume_has_feature($fs_on,  'copy', 'S',
     ok_case('csi clone: gate names the probe',
         ($@ && $@ =~ /probe-clone-from-snapshot/) ? 'yes' : 'no', 'yes');
 
+    # ---- the existence pre-check must read the ARRAY's not-found correctly --
+    # Storage Virtualize answers "no such object" with 409 + CMMVC5754E, an
+    # ERROR status, so _cmd dies and _vdisk never reaches its own not-found
+    # die. Matching only /not found/ made the one reply meaning "this name is
+    # free" abort the restore - which broke every K10 restore and export,
+    # since K10 clones into a name it has already minted. It must still fail
+    # CLOSED on everything else, or mkvolume runs over a live volume.
+    for my $t (
+        [ 'array says CMMVC5754E',
+          "flashsystem: lsvdisk failed: 409 Conflict \"error code: 1, error text:"
+          . " CMMVC5754E The specified object does not exist, or the name supplied"
+          . " does not meet the naming rules.\"\n", 'proceeds' ],
+        [ 'plugin says not found', "flashsystem: vdisk 'k8ss-vm-1-disk-0' not found\n", 'proceeds' ],
+        [ 'auth refused',      "flashsystem: lsvdisk failed: 401 Unauthorized\n",        'refuses' ],
+        [ 'forbidden',         "flashsystem: lsvdisk failed: 403 Forbidden\n",           'refuses' ],
+        [ 'throttled out',     "flashsystem: lsvdisk failed: 429 Too Many Requests\n",   'refuses' ],
+        [ 'array unreachable', "flashsystem: lsvdisk failed: 500 Internal Server Error\n",'refuses' ],
+        [ 'bad JSON',          "flashsystem: lsvdisk: bad JSON response: <html>\n",      'refuses' ],
+    ) {
+        my ($label, $lsvdisk_err, $want) = @$t;
+        my @issued;
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my ($scfg, $command, $target, $params) = @_;
+            return [ { snapshot_id => 31, snapshot_name => 'k8ss-vm-9999-pvc-a.3bcdefghi',
+                       volume_name => 'k8ss-vm-9999-pvc-a', state => 'active' } ]
+                if $command eq 'lsvolumesnapshot';
+            die $lsvdisk_err if $command eq 'lsvdisk';
+            push @issued, $command;
+            return { id => '31' };
+        };
+        eval { $P->csi_volume_from_snapshot(
+            { fsprefix => 'k8ss', fspool => 'P', fssnapshots => 1, fsrestore => 1 },
+            'S', 'k8ss-vm-9999-pvc-a.3bcdefghi', volname => 'vm-4242-disk-0') };
+        my $got = (grep { $_ eq 'mkvolume' } @issued) ? 'proceeds'
+                : ($@ && $@ =~ /cannot verify whether/) ? 'refuses'
+                : "(!? $@)";
+        ok_case("csi clone existence: $label", $got, $want);
+    }
+
+    # And a volume that genuinely IS there must still stop the restore.
+    {
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my ($scfg, $command) = @_;
+            return [ { snapshot_id => 31, snapshot_name => 'k8ss-vm-9999-pvc-a.3bcdefghi',
+                       volume_name => 'k8ss-vm-9999-pvc-a', state => 'active' } ]
+                if $command eq 'lsvolumesnapshot';
+            return { name => 'k8ss-vm-4242-disk-0', capacity => 1 } if $command eq 'lsvdisk';
+            return { id => '31' };
+        };
+        eval { $P->csi_volume_from_snapshot(
+            { fsprefix => 'k8ss', fspool => 'P', fssnapshots => 1, fsrestore => 1 },
+            'S', 'k8ss-vm-9999-pvc-a.3bcdefghi', volname => 'vm-4242-disk-0') };
+        ok_case('csi clone existence: real collision still refuses',
+            ($@ && $@ =~ /already exists/) ? 'dies' : "(!? $@)", 'dies');
+    }
+
     # A row the array cannot attribute to the source volume must NOT become a
     # clone source: the id resolved here becomes mkvolume's -fromsnapshotid,
     # and cloning the wrong snapshot serves another volume's data silently.
