@@ -717,6 +717,68 @@ ok_case('feature copy from snap',   $P->volume_has_feature($fs_on,  'copy', 'S',
     }
 }
 
+# ---- _unmap_volume: the mirror of the _map_volume bug --------------------
+# The old swallow list missed CMMVC9069E, "Volume does not have a shared
+# mapping to this host cluster" - wording that matches neither "does not
+# exist" nor "not mapped". An already-unmapped volume therefore killed
+# free_image, so DeleteVolume failed for a volume already in the desired
+# state. Seen repeatedly in the PVE task log on 2026-09-14.
+{
+    my $sc = { fsprefix => 'k8ss', fshostgroup => 'pmcl01' };
+    no warnings 'redefine';
+    my $UV = $P->can('_unmap_volume');
+
+    my @sent;
+    local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+        my (undef, $command) = @_; push @sent, $command; return {};
+    };
+    ok_case('unmap: clean unmap returns',  $UV->($sc, 'vm-1-disk-0', 'S'), 1);
+    ok_case('unmap: happy path is one call', scalar(@sent), 1);
+
+    # Refused, and nothing is mapped -> success, whatever the code.
+    for my $code ('CMMVC9069E Volume does not have a shared mapping to this host cluster',
+                  'CMMVC5753E does not exist',
+                  'CMMVC0000X a wording nobody enumerated') {
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my (undef, $command) = @_;
+            die "flashsystem: rmvolumehostclustermap failed: 409 $code\n"
+                if $command eq 'rmvolumehostclustermap';
+            return [] if $command eq 'lsvdiskhostmap';
+            return [];
+        };
+        ok_case("unmap: refused but unmapped ($code)",
+            (eval { $UV->($sc, 'vm-1-disk-0', 'S') } // "died: $@"), 1);
+    }
+
+    # Refused AND still mapped -> must die; the volume is not in the state
+    # free_image is about to assume.
+    {
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my (undef, $command) = @_;
+            die "flashsystem: rmvolumehostclustermap failed: 409 CMMVC9069E\n"
+                if $command eq 'rmvolumehostclustermap';
+            return [ { host_name => 'nosvgsmpm003' } ] if $command eq 'lsvdiskhostmap';
+            return [];
+        };
+        eval { $UV->($sc, 'vm-1-disk-0', 'S') };
+        ok_case('unmap: still-mapped dies',
+            ($@ && $@ =~ /STILL mapped/) ? 'dies' : "(!? $@)", 'dies');
+    }
+
+    # Unreadable read-back must not be read as "unmapped".
+    {
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            my (undef, $command) = @_;
+            die "flashsystem: rmvolumehostclustermap failed: 409 CMMVC9069E\n"
+                if $command eq 'rmvolumehostclustermap';
+            die "flashsystem: lsvdiskhostmap failed: 429\n";
+        };
+        eval { $UV->($sc, 'vm-1-disk-0', 'S') };
+        ok_case('unmap: unreadable read-back dies',
+            ($@ && $@ =~ /CMMVC9069E/) ? 'dies' : "(!? $@)", 'dies');
+    }
+}
+
 # ---- the SCSI rescan flags ------------------------------------------------
 # -a -r -u, and each covers a case the others miss. -u is the one that took a
 # live failure to learn: -r only removes a LUN the array has stopped reporting,

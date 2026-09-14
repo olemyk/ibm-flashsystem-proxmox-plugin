@@ -418,12 +418,35 @@ sub _map_volume {
 
 sub _unmap_volume {
     my ($scfg, $volname, $storeid) = @_;
-    eval { _cmd($scfg, 'rmvolumehostclustermap', _arrayname($scfg, $volname), { hostcluster => $scfg->{fshostgroup} }, storeid => $storeid); };
-    if (my $err = $@) {
-        # not mapped / gone is fine.
-        die $err unless $err =~ /does not exist|not mapped|CMMVC5753E|CMMVC5842E|CMMVC6071E/i;
-    }
-    return 1;
+    my $aname = _arrayname($scfg, $volname);
+    eval { _cmd($scfg, 'rmvolumehostclustermap', $aname,
+        { hostcluster => $scfg->{fshostgroup} }, storeid => $storeid); };
+    my $err = $@;
+    return 1 if !$err;    # happy path: no read-back, no extra REST call
+
+    # Same principle as _map_volume, and for the same reason. The swallow list
+    # here used to be /does not exist|not mapped|CMMVC5753E|CMMVC5842E|
+    # CMMVC6071E/ - and it missed CMMVC9069E, "Volume does not have a shared
+    # mapping to this host cluster", whose wording matches neither "does not
+    # exist" nor "not mapped". So an ALREADY-UNMAPPED volume killed free_image,
+    # and DeleteVolume failed for a volume that was already in the state we
+    # wanted. Seen on pmcl01 2026-09-14, repeatedly, in the PVE task log.
+    #
+    # Enumerating one more code would just be the next guess. Ask the array
+    # instead: if nothing is mapped, the unmap has achieved its purpose no
+    # matter which code any firmware chose to report.
+    my $rows = eval { _hostmap_rows($scfg, $volname, $storeid) };
+    my $read_err = $@;
+
+    # Unreadable: do NOT assume unmapped. free_image's rmvdisk is the backstop -
+    # the array refuses to delete a mapped volume - so surfacing the original
+    # error is safe and honest here.
+    die $err if $read_err;
+    return 1 if !@$rows;
+
+    die "flashsystem: '$aname' is STILL mapped to " . scalar(@$rows)
+        . " host(s) after rmvolumehostclustermap: " . _hostmap_names($rows)
+        . "\n  array said: $err";
 }
 
 # ---- Host-side block device plumbing ------------------------------------

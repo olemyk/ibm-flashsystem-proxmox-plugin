@@ -85,6 +85,16 @@ Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
   that only runs when the fast path has already failed, so a normal attach never
   pays for it.
   This also vindicates `-u`: it surfaced a remapped LUN that `-a -r` never saw.
+- **`_unmap_volume` had the mirror of the same bug.** Its swallow list missed
+  `CMMVC9069E` - *"Volume does not have a shared mapping to this host cluster"* -
+  whose wording matches neither `does not exist` nor `not mapped`. So an
+  ALREADY-UNMAPPED volume killed `free_image`, and `DeleteVolume` failed for a
+  volume that was already in the state we wanted. Seen repeatedly in the pmcl01
+  task log on 2026-09-14. Enumerating one more code would have been the next
+  guess; it now reads `lsvdiskhostmap` back, and nothing mapped means the unmap
+  achieved its purpose whatever code the firmware reported. An unreadable
+  read-back surfaces the original error rather than assuming - `rmvdisk` is the
+  backstop, since the array refuses to delete a mapped volume.
 - **`_map_volume` swallowed a refusal as a success.** It matched the array's
   error text against a list of "already mapped" codes, three of which -
   `CMMVC6071E`, `CMMVC5879E`, `CMMVC6070E` - are HOST-level, included on the
