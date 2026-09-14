@@ -52,6 +52,20 @@ Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
   volume's contents *without deleting any object*, so it trips no capacity or
   object-count monitoring. An unknown or absent state refuses, like the
   `volume_size_mismatch` guard beside it.
+- **The attach device poll was 15 seconds, and that was the real attach bug.**
+  When the array RECYCLES a LUN number - constant once Kubernetes churns PVCs -
+  `rescan-scsi-bus.sh -u` detects the remap and the refresh then completes
+  ASYNCHRONOUSLY. Measured on pmcl01 2026-09-14: the first attach reported
+  "8 remapped or resized device(s) found / 0 device(s) removed", polled its 15s,
+  found nothing and failed; the attacher retried two seconds later, discovered
+  nothing new at all, and succeeded - because udev and multipath had finished
+  settling meanwhile. The device was always coming. On a node carrying hundreds
+  of SCSI devices the rescan alone takes ~14s and `udevadm settle` is documented
+  as "can take a while", so 15s left nothing for the part that matters. Now 60s,
+  with one additional rescan at the 20s mark for the recycled-LUN case - and
+  that only runs when the fast path has already failed, so a normal attach never
+  pays for it.
+  This also vindicates `-u`: it surfaced a remapped LUN that `-a -r` never saw.
 - **`_map_volume` swallowed a refusal as a success.** It matched the array's
   error text against a list of "already mapped" codes, three of which -
   `CMMVC6071E`, `CMMVC5879E`, `CMMVC6070E` - are HOST-level, included on the

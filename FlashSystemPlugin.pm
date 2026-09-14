@@ -441,12 +441,12 @@ sub _rescan_scsi {
     # neither new nor removed, and -a -r would leave a stale device that makes
     # multipath assemble the OLD map.
     #
-    # Honesty about 2026-09-14: `-a -r -u` was tried against the failing attach
-    # on nosvgsmpm007 and did NOT resolve it (14s, "0 device(s) removed", device
-    # still absent). The actual failure there was a mapping that never reached
-    # this node, which no rescan can fix. -u stays because a remapped LUN is a
-    # real case and this is the documented flag for it - but if attach latency
-    # ever matters, drop it: the tests pin the flag set either way.
+    # -u earns its place, confirmed 2026-09-14: attaching a clone on
+    # nosvgsmpm003 it reported "8 remapped or resized device(s) found" at LUN 21
+    # - a slot the array had recycled - which -a -r had never surfaced. Note it
+    # then reports "0 device(s) removed": it flags the identity change and the
+    # refresh completes asynchronously, which is why the device poll below needs
+    # a budget measured in tens of seconds rather than a handful.
     if (run_command([ 'sh', '-c', 'command -v rescan-scsi-bus.sh >/dev/null 2>&1' ], noerr => 1) == 0) {
         run_command([ 'rescan-scsi-bus.sh', '-a', '-r', '-u' ], noerr => 1);
     } else {
@@ -1188,9 +1188,35 @@ sub activate_volume {
     run_command([ 'multipath', '-a', $wwid ], noerr => 1);    # whitelist the wwid
     run_command([ 'multipath' ],             noerr => 1);     # (re)assemble maps
 
-    for my $try (1 .. 30) {
+    # 120 x 0.5s = 60s, not the 15s this used to allow.
+    #
+    # Measured on pmcl01 2026-09-14, attaching a fresh clone to VM 164 on
+    # nosvgsmpm003. The array had RECYCLED LUN 21, so rescan-scsi-bus.sh -u
+    # reported 8 remapped devices - and refreshing them is ASYNCHRONOUS. The
+    # first attach ran the rescan, whitelisted the wwid, polled its 15s, found
+    # nothing and failed. The attacher retried 2 seconds later; that attempt
+    # discovered NOTHING NEW ("0 new, 0 remapped, 0 removed") and succeeded,
+    # because udev and multipath had finished settling in the meantime.
+    #
+    # So the device was always coming - the budget was just too small. On a node
+    # carrying hundreds of SCSI devices the rescan alone takes ~14s and
+    # udevadm settle is explicitly "can take a while". 15s left nothing for the
+    # part that actually matters.
+    #
+    # A second rescan partway through, because a recycled LUN sometimes needs
+    # one: the first pass notices the identity changed, the second finds the
+    # settled device. It costs ~14s and only runs when the fast path has
+    # already failed, so a normal attach never pays for it.
+    my $rescanned_again = 0;
+    for my $try (1 .. 120) {
         last if -e $dev;
         run_command([ 'multipath' ], noerr => 1) if $try % 5 == 0;
+        if ($try == 40 && !$rescanned_again) {
+            $rescanned_again = 1;
+            _rescan_scsi();
+            run_command([ 'multipath', '-a', $wwid ], noerr => 1);
+            run_command([ 'multipath' ], noerr => 1);
+        }
         select(undef, undef, undef, 0.5);
     }
     if (!-e $dev) {
