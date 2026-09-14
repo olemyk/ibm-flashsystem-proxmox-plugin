@@ -1052,7 +1052,25 @@ sub free_image {
     # Release this node's block device before removing the vdisk. deactivate_volume
     # normally did this already; repeat it for the direct `pvesm free` path (no VM
     # lifecycle) so we never leave stale SCSI devices behind to mask a future LUN.
-    my $wwid = eval { _wwid($scfg, $volname, $storeid) };
+    # ALREADY GONE IS SUCCESS. CSI requires DeleteVolume to be idempotent, and
+    # external-provisioner retries routinely - a lost or slow first response is
+    # enough. Without this the retry dies (the array answers CMMVC5754E for
+    # every command naming a volume that no longer exists, including the
+    # mapping read-back in _unmap_volume) and the PVC sits in Terminating
+    # forever. `pvesm free` on an already-deleted volume failed the same way.
+    #
+    # Fail CLOSED on anything else, exactly as csi_volume_from_snapshot does:
+    # an unreachable array, a 401/403 or an exhausted 429 backoff must never be
+    # read as "already deleted", or a live volume is reported destroyed and the
+    # capacity leaks with nothing referencing it.
+    my $vdisk = eval { _vdisk($scfg, $volname, $storeid) };
+    if (!$vdisk) {
+        my $err = $@;
+        return undef if defined($err) && $err =~ /CMMVC5754E|\bnot found\b/i;
+        die $err if $err;
+        return undef;
+    }
+    my $wwid = eval { _wwid_from_vdisk($vdisk) };
     _flush_device($wwid) if $wwid;
     _unmap_volume($scfg, $volname, $storeid);
 

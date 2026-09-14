@@ -385,6 +385,11 @@ ok_case('feature copy from snap',   $P->volume_has_feature($fs_on,  'copy', 'S',
     # only other array touches; stub the lot and record the command order.
     local *PVE::Storage::Custom::FlashSystemPlugin::_wwid = sub { return undef };
     local *PVE::Storage::Custom::FlashSystemPlugin::_unmap_volume = sub { return 1 };
+    # free_image looks the volume up FIRST now - absent means already deleted,
+    # which is success per CSI idempotency - so these cases must find one.
+    local *PVE::Storage::Custom::FlashSystemPlugin::_vdisk = sub {
+        return { name => 'k8ss-vm-9999-pvc-a', id => 1 };
+    };
 
     # Happy path: rmvdisk succeeds, so nothing else is called at all.
     my @seq;
@@ -714,6 +719,40 @@ ok_case('feature copy from snap',   $P->volume_has_feature($fs_on,  'copy', 'S',
         };
         ok_case('map: bare hash row counts as mapped',
             (eval { $MV->($sc, 'vm-1-disk-0', 'S') } // "died: $@"), 1);
+    }
+}
+
+# ---- free_image must be IDEMPOTENT ---------------------------------------
+# CSI requires DeleteVolume to return OK for a volume that is already gone,
+# and external-provisioner retries routinely - a lost or slow first response
+# is enough. Without this the retry dies (the array answers CMMVC5754E for
+# every command naming a volume that no longer exists, including the mapping
+# read-back inside _unmap_volume) and the PVC sits in Terminating forever.
+# `pvesm free` on an already-deleted volume failed exactly this way on
+# pmcl01 2026-09-14.
+{
+    my $sc = { fsprefix => 'k8ss', fshostgroup => 'pmcl01', fssnapshots => 1 };
+    no warnings 'redefine';
+    for my $t (
+        [ 'array says CMMVC5754E',
+          "flashsystem: lsvdisk failed: 409 Conflict \"error code: 1, error text:"
+          . " CMMVC5754E The specified object does not exist...\"\n", 'returns' ],
+        [ 'plugin says not found', "flashsystem: vdisk 'k8ss-vm-1-disk-0' not found\n", 'returns' ],
+        [ 'auth refused',   "flashsystem: lsvdisk failed: 401 Unauthorized\n",      'dies' ],
+        [ 'forbidden',      "flashsystem: lsvdisk failed: 403 Forbidden\n",         'dies' ],
+        [ 'throttled out',  "flashsystem: lsvdisk failed: 429 Too Many Requests\n", 'dies' ],
+        [ 'unreachable',    "flashsystem: lsvdisk failed: 500 Internal\n",          'dies' ],
+    ) {
+        my ($label, $err, $want) = @$t;
+        my @sent;
+        local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+            push @sent, $_[1]; die $err;
+        };
+        my $ok = eval { $P->free_image('S', $sc, 'vm-9999-pvc-a', 0, 'raw'); 1 };
+        ok_case("free: $label", ($ok ? 'returns' : 'dies'), $want);
+        # An absent volume must not issue destructive commands either.
+        ok_case("free: $label sends no rmvdisk",
+            ((grep { $_ eq 'rmvdisk' } @sent) ? 'sent' : 'none'), 'none');
     }
 }
 

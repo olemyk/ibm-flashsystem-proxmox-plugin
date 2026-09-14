@@ -85,6 +85,18 @@ Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
   that only runs when the fast path has already failed, so a normal attach never
   pays for it.
   This also vindicates `-u`: it surfaced a remapped LUN that `-a -r` never saw.
+- **`DeleteVolume` was not idempotent, which CSI requires it to be.** Every
+  array command naming a volume that no longer exists answers `CMMVC5754E`,
+  including the mapping read-back inside `_unmap_volume` - so `free_image` died
+  on an already-deleted volume. `external-provisioner` retries deletes
+  routinely, and a lost or slow first response is enough, so the retry would
+  fail forever and leave the PVC in `Terminating`. `pvesm free` on an
+  already-deleted volume failed the same way on pmcl01 2026-09-14. It now looks
+  the volume up first: absent is success. Everything else still fails CLOSED -
+  an unreachable array, a 401/403 or an exhausted 429 backoff must never read as
+  "already deleted", or a live volume is reported destroyed and its capacity
+  leaks with nothing referencing it. Twelve cases pin both directions, including
+  that an absent volume issues no `rmvdisk`.
 - **`_unmap_volume` had the mirror of the same bug.** Its swallow list missed
   `CMMVC9069E` - *"Volume does not have a shared mapping to this host cluster"* -
   whose wording matches neither `does not exist` nor `not mapped`. So an
