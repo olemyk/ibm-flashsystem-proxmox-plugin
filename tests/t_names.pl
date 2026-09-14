@@ -735,6 +735,16 @@ ok_case('feature copy from snap',   $P->volume_has_feature($fs_on,  'copy', 'S',
         ok_case('rescan: -r (drop vanished LUNs)',      ($f{'-r'} ? 1 : 0), 1);
         ok_case('rescan: -u (catch REMAPPED LUNs)',     ($f{'-u'} ? 1 : 0), 1);
     }
+    # The FC-host scan runs ALWAYS, not only as a fallback. rescan-scsi-bus.sh
+    # infers its LUN range from what the node already has, so a node that has
+    # never seen a high LUN reports "0 new" while the LUN sits there presented
+    # and unseen - which is why attach worked on 3 of 12 nodes and failed on
+    # the rest until 2026-09-14.
+    my ($fcscan) = grep { ($_->[-1] // '') =~ m{/sys/class/fc_host/} } @PVE::Tools::CALLS;
+    ok_case('rescan: FC scan runs even WITH sg3-utils', ($fcscan ? 'yes' : 'no'), 'yes');
+    ok_case('rescan: FC scan is a full "- - -"',
+        (($fcscan->[-1] // '') =~ m{echo "- - -"} ? 'yes' : 'no'), 'yes');
+
     # The no-sg3-utils fallback must still scan, or a node without the package
     # silently stops discovering anything.
     local %PVE::Tools::RC = ( 'sh' => 1 );   # `command -v rescan-scsi-bus.sh` fails
@@ -742,6 +752,16 @@ ok_case('feature copy from snap',   $P->volume_has_feature($fs_on,  'copy', 'S',
     $P->can('_rescan_scsi')->();
     my $fellback = grep { ($_->[-1] // '') =~ m{/sys/class/scsi_host} } @PVE::Tools::CALLS;
     ok_case('rescan: falls back to a sysfs scan', ($fellback ? 'yes' : 'no'), 'yes');
+    # ...and that fallback must scan FC hosts ONLY. A wildcard over every
+    # scsi_host includes the local SAS controller, where sas_user_scan blocks
+    # in uninterruptible D state holding the SCSI scan mutex - it hung
+    # nosvgsmpm010 for 368+ seconds on 2026-09-14 with two stacked tasks.
+    my ($fb) = grep { ($_->[-1] // '') =~ m{/sys/class/scsi_host} } @PVE::Tools::CALLS;
+    ok_case('rescan: fallback filters on fc_host',
+        (($fb->[-1] // '') =~ m{/sys/class/fc_host/} ? 'yes' : 'no'), 'yes');
+    ok_case('rescan: fallback does NOT wildcard every scsi_host',
+        (($fb->[-1] // '') =~ m{for h in /sys/class/scsi_host/host\*} ? 'wildcards' : 'filtered'),
+        'filtered');
 }
 
 # ---- _pool_is_drp + alloc_image threading ---------------------------------

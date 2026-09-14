@@ -429,29 +429,51 @@ sub _unmap_volume {
 # ---- Host-side block device plumbing ------------------------------------
 
 sub _rescan_scsi {
-    # Prefer sg3-utils. Three flags, and each covers a case the others miss:
-    #   -a  add new LUNs
-    #   -r  remove LUNs the array no longer reports at all
-    #   -u  "look for existing disks that have been remapped" (its own --help)
+    # TWO passes, and neither replaces the other.
     #
-    # -u is included on the documented semantics, NOT on evidence that it fixes
-    # anything here. -r only removes a LUN the array has stopped reporting; when
-    # the array RECYCLES a LUN number to a different volume - plausible once
-    # Kubernetes churns PVCs - that slot still reports something, so it is
-    # neither new nor removed, and -a -r would leave a stale device that makes
-    # multipath assemble the OLD map.
+    # 1. rescan-scsi-bus.sh -a -r -u, when sg3-utils is installed. It is the
+    #    only one of the two that can REMOVE a LUN the array has stopped
+    #    reporting (-r) or refresh one whose identity changed because the array
+    #    RECYCLED the slot (-u). -u earned its place on 2026-09-14: it reported
+    #    "8 remapped or resized device(s) found" at LUN 21, which -a -r had
+    #    never surfaced. Note it then says "0 device(s) removed" - it flags the
+    #    change and the refresh completes asynchronously, which is why
+    #    activate_volume polls in tens of seconds rather than a handful.
     #
-    # -u earns its place, confirmed 2026-09-14: attaching a clone on
-    # nosvgsmpm003 it reported "8 remapped or resized device(s) found" at LUN 21
-    # - a slot the array had recycled - which -a -r had never surfaced. Note it
-    # then reports "0 device(s) removed": it flags the identity change and the
-    # refresh completes asynchronously, which is why the device poll below needs
-    # a budget measured in tens of seconds rather than a handful.
+    # 2. A full FC-host scan, ALWAYS, even when the script ran. The script
+    #    infers its LUN range from what the node ALREADY has, so a node that
+    #    has never discovered a high LUN walks a handful, finds nothing, and
+    #    honestly reports "0 new or changed device(s) found" while the LUN sits
+    #    there presented and unseen.
+    #
+    #    Measured 2026-09-14: nosvgsmpm010 sat at maxLUN 3 with attaches
+    #    failing and the array insisting the volume was mapped to all twelve
+    #    hosts. One "- - -" to its FC hosts took it to maxLUN 22 INSTANTLY and
+    #    the missing /dev/mapper/3<UID> appeared. That explained the entire
+    #    failure pattern: attach worked on the three nodes hosting the k8s VMs
+    #    - already discovered to LUN 22-24 through sheer activity - and failed
+    #    on the nine that had not. Kubernetes schedules anywhere.
+    #
+    # fc_host ONLY, and that filter is load-bearing. A wildcard over every
+    # /sys/class/scsi_host/host* reaches the local SAS controller (the HPE
+    # Smart Array holding the ZFS mirror), where sas_user_scan blocks in
+    # UNINTERRUPTIBLE D state while holding the SCSI scan mutex - it wedged
+    # nosvgsmpm010 for 368+ seconds with two stacked unkillable tasks:
+    #
+    #   scsi_scan_target / scan_channel_zero [scsi_transport_sas]
+    #   / sas_user_scan [scsi_transport_sas] / store_scan
+    #
+    # Over FC the identical scan returns instantly. The array is behind the
+    # QLogic HBAs and nothing else, so scanning anything else is pure risk.
     if (run_command([ 'sh', '-c', 'command -v rescan-scsi-bus.sh >/dev/null 2>&1' ], noerr => 1) == 0) {
         run_command([ 'rescan-scsi-bus.sh', '-a', '-r', '-u' ], noerr => 1);
-    } else {
-        run_command([ 'sh', '-c', 'for h in /sys/class/scsi_host/host*/scan; do echo "- - -" > "$h"; done' ], noerr => 1);
     }
+    run_command([ 'sh', '-c',
+        'for h in /sys/class/fc_host/host*; do'
+        . ' [ -e "$h" ] || continue;'
+        . ' echo "- - -" > "/sys/class/scsi_host/$(basename "$h")/scan" 2>/dev/null;'
+        . ' done' ], noerr => 1);
+    return 1;
 }
 
 # Where the kernel publishes block devices, and where multipath publishes its

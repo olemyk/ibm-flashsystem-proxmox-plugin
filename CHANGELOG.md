@@ -52,6 +52,25 @@ Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
   volume's contents *without deleting any object*, so it trips no capacity or
   object-count monitoring. An unknown or absent state refuses, like the
   `volume_size_mismatch` guard beside it.
+- **Attach only ever worked on 3 of 12 nodes, and nothing said so.**
+  `rescan-scsi-bus.sh` infers its LUN range from what a node ALREADY has. A node
+  that has never discovered a high LUN walks a handful, finds nothing, and
+  honestly reports "0 new or changed device(s) found" - while the LUN sits there
+  presented and unseen. Measured 2026-09-14: `nosvgsmpm010` sat at maxLUN 3 with
+  attaches failing and the array insisting the volume was mapped to all twelve
+  hosts; one `"- - -"` to its FC hosts took it to **maxLUN 22 instantly** and the
+  missing `/dev/mapper/3<UID>` appeared. That explained the whole pattern -
+  attach worked on the three nodes hosting the k8s VMs, already discovered to
+  LUN 22-24 through sheer activity, and failed on the nine that had not.
+  Kubernetes schedules anywhere. `_rescan_scsi` now ALWAYS follows the script
+  with a full FC-host scan; neither pass replaces the other, since only the
+  script removes vanished LUNs and refreshes remapped ones.
+- **A wildcard SCSI scan can wedge a node, and the fallback did one.** Scanning
+  every `/sys/class/scsi_host/host*` reaches the local SAS controller, where
+  `sas_user_scan` blocks in UNINTERRUPTIBLE D state holding the SCSI scan mutex
+  - two stacked unkillable tasks on `nosvgsmpm010`, "blocked for more than 368
+  seconds". Both scan paths now filter on `/sys/class/fc_host/`, where the same
+  scan returns instantly. The array is behind the QLogic HBAs and nothing else.
 - **The attach device poll was 15 seconds, and that was the real attach bug.**
   When the array RECYCLES a LUN number - constant once Kubernetes churns PVCs -
   `rescan-scsi-bus.sh -u` detects the remap and the refresh then completes
