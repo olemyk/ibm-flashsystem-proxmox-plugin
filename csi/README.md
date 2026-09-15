@@ -206,8 +206,9 @@ allocation. It first reached the array on 2026-09-14 and the whole chain has
 since run, including the cross-host case, on both tiers. Every documented
 data-reduction-pool restriction on `mkvolume` concerns parameters this call
 does not pass, and the call was accepted — but on tiers whose pool type is not
-recorded here, so the data-reduction-pool case stays open (ROADMAP §8,
-question 1), and that is evidence about *this* array either way.
+recorded here, so the data-reduction-pool case stays untested (ROADMAP §8,
+question 1). Run the probe if you are on a DRP; it is evidence about *this*
+array either way.
 "Documented as unrestricted" is still worth exactly what the `-warning`
 rejection was worth, which is to say a wasted afternoon.
 

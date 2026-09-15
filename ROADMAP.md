@@ -136,10 +136,13 @@ What that run did **not** settle, and what keeps this section open:
 - **Questions 2, 4 and 5 below are untouched by it** — the run never issued
   `restorefromsnapshot`, never removed a snapshot a thinclone still depended
   on, and never exercised `-filtervalue`.
-- **Question 1 depends on the pool type behind the tiers that ran, and that is
-  not recorded anywhere in this repo.** `lsmdiskgrp`'s `data_reduction` value
-  for the pools behind `k8s-archive` and `k8s-silver` would close it or leave
-  it open; until someone writes it down, treat the DRP case as untested.
+- **Question 1 is unlikely ever to be answered here, and that is fine.** It
+  turns on the pool type behind the tiers that ran, which this repo does not
+  record. It is also aimed at a pool type IBM is phasing out — open question 1
+  in the README is precisely about what replaces DRP guidance — so treat the
+  DRP case as untested rather than as work outstanding. Anyone porting this to
+  a data reduction pool should run the probe there; nobody needs to
+  retro-document ours.
 - **Question 3 is narrower than it looks.** No ordinary delete asks probe
   assertion O — whether `rmvdisk` succeeds while snapshots are still
   *present* — because `free_image` reaps a volume's snapshots before issuing
