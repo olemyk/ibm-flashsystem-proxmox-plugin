@@ -788,17 +788,17 @@ Ext.define('PVE.FlashSystemUI', {
         { label: 'Volumes (front end)', spark: true, metrics: [
             { k: 'vdisk_r_io', l: 'Read IOPS' }, { k: 'vdisk_w_io', l: 'Write IOPS' },
             { k: 'vdisk_r_mb', l: 'Read', u: 'MB/s' }, { k: 'vdisk_w_mb', l: 'Write', u: 'MB/s' },
-            { k: 'vdisk_r_ms', l: 'Read latency' },
-            { k: 'vdisk_w_ms', l: 'Write latency' } ] },
+            { k: 'vdisk_r_ms', l: 'Read latency (ms)' },
+            { k: 'vdisk_w_ms', l: 'Write latency (ms)' } ] },
         { label: 'MDisks (back end)', metrics: [
             { k: 'mdisk_r_io', l: 'Read IOPS' }, { k: 'mdisk_w_io', l: 'Write IOPS' },
             { k: 'mdisk_r_mb', l: 'Read', u: 'MB/s' }, { k: 'mdisk_w_mb', l: 'Write', u: 'MB/s' },
-            { k: 'mdisk_r_ms', l: 'Read latency' },
-            { k: 'mdisk_w_ms', l: 'Write latency' } ] },
+            { k: 'mdisk_r_ms', l: 'Read latency (ms)' },
+            { k: 'mdisk_w_ms', l: 'Write latency (ms)' } ] },
         { label: 'Drives', metrics: [
             { k: 'drive_r_io', l: 'Read IOPS' }, { k: 'drive_w_io', l: 'Write IOPS' },
-            { k: 'drive_r_ms', l: 'Read latency' },
-            { k: 'drive_w_ms', l: 'Write latency' } ] },
+            { k: 'drive_r_ms', l: 'Read latency (ms)' },
+            { k: 'drive_w_ms', l: 'Write latency (ms)' } ] },
         { label: 'Interfaces', metrics: [
             { k: 'fc_io', l: 'FC IOPS' }, { k: 'fc_mb', l: 'FC', u: 'MB/s' },
             { k: 'iscsi_io', l: 'iSCSI IOPS' }, { k: 'iscsi_mb', l: 'iSCSI', u: 'MB/s' },
@@ -852,16 +852,28 @@ Ext.define('PVE.FlashSystemUI', {
 
         // Two things the reader has to know to trust these numbers.
         //
-        // The unit: IBM's own 8.7 documentation contradicts itself on the
-        // *_ms statistics - the stat_name descriptions say microseconds, the
-        // attribute table reads as milliseconds, and the Performance
-        // statistics page says the CLI always shows microseconds. Guessing
-        // wrong is a 1000x error, so the raw value is shown unlabelled until
-        // it is checked against the array's own GUI.
+        // The unit: RESOLVED 2026-09-15, by IBM, with array output rather than
+        // documentation. The *_ms statistics are MILLISECONDS. IBM's own 8.7
+        // docs contradict themselves - the stat_name descriptions say
+        // microseconds, the attribute table says milliseconds, and the
+        // Performance statistics page says the CLI always shows microseconds -
+        // and guessing wrong is a 1000x error, so these were rendered
+        // unlabelled until someone with the array could settle it.
+        //
+        // The attribute table is the correct one. On 9.1.0.2:
+        //     mdisk_ms  0.000  10.103     -> 10.103 ms
+        //     drive_ms  0.618   0.790     ->  0.790 ms, i.e. 790 microseconds
+        // and on an older V7000 at 8.3.1.10 the same fields are integers with
+        // no decimal place (mdisk_w_ms 9, drive_r_ms 22), which is the same
+        // unit at lower precision.
+        //
+        // CAVEAT worth keeping: attested on 9.1.0.2 and 8.3.1.10. pmcl01 runs
+        // 8.7.x, which sits between them, so ms is the safe reading - but it
+        // is an inference across versions, not a direct observation on ours.
         let notes = [gettext(
-            'Latency is shown as the array reports it. IBM documents these '
-            + 'values inconsistently as microseconds or milliseconds - compare '
-            + 'once against the array GUI before treating the unit as known.')];
+            'Latency is in milliseconds, confirmed against array output on '
+            + '9.1.0.2 and 8.3.1.10. IBM 8.7 documentation contradicts itself '
+            + 'on this - the attribute table is the correct one.')];
         if (d.performance && d.performance.derived) {
             notes.push(gettext(
                 'System totals are derived from per-node statistics: '
