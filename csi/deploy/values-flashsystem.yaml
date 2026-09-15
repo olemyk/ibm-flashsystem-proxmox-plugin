@@ -1,0 +1,184 @@
+# Values overlay for the upstream proxmox-csi-plugin chart, adding FlashSystem
+# array snapshots.
+#
+#   helm upgrade --install proxmox-csi-plugin \
+#     oci://ghcr.io/sergelogvinov/charts/proxmox-csi-plugin \
+#     --version 0.5.10 \
+#     -n csi-proxmox \
+#     -f values-flashsystem.yaml \
+#     -f your-cloud-config.yaml
+#
+# The namespace must already exist, WITH pod-security labels — see below.
+#
+# BOTH -f files, always. This overlay carries no `config.clusters`, and the
+# chart gates its credentials Secret on `len .Values.config.clusters != 0`
+# while mounting `secretName: proxmox-csi-plugin` unconditionally and without
+# `optional: true`. Run this without the cloud-config and helm reports success
+# while the controller sits in ContainerCreating forever —
+# `MountVolume.SetUp failed for volume "cloud-config": secret not found` — and
+# no PVC ever provisions. On an UPGRADE of a working release it is worse: the
+# Secret was in the previous manifest and absent from the new one, so helm
+# DELETES it and rolls the pod at the same time, taking provisioning, attach
+# and resize down for every existing PVC under a green `helm upgrade`.
+#
+# Pin --version to the chart already deployed: otherwise a values change
+# silently bumps the driver too, and then a failure has two possible causes.
+#
+# NB: no `--force-conflicts`. That flag does not exist in Helm 3 (`helm
+# upgrade` exits `Error: unknown flag` before rendering anything) — it is
+# Helm 4, where server-side apply reports a conflict on any field a previous
+# operator patched by hand, .spec.storageCapacity being the one that bites
+# here. On Helm 4 add it; on Helm 3, `--take-ownership` (>= 3.17) is the
+# equivalent escape hatch for resources the release does not own.
+#
+# Only the CONTROLLER image changes. The node plugin is stock: snapshots are a
+# controller-service concern and attach/mount already work.
+
+# ── the namespace ──────────────────────────────────────────────────────────
+# Left FALSE, and the namespace is created by hand instead (see below). Not an
+# oversight — the two obvious options both misfire:
+#
+#   * `helm ... -n csi-proxmox` with no namespace fails outright: Helm 3 stores
+#     the release secret in the target namespace and will not create it.
+#   * `--create-namespace` makes a BARE namespace, which then inherits whatever
+#     pod-security default the cluster enforces. The node plugin mounts host
+#     paths and runs privileged, so under a `restricted` default its DaemonSet
+#     is rejected at admission — and every pod with a PVC then hangs at
+#     ContainerCreating with the reason visible only in the DaemonSet's events.
+#     Setting createNamespace: true as well does not fix that, because the
+#     chart cannot adopt a namespace Helm already made ("invalid ownership
+#     metadata") without --take-ownership.
+#
+# So create it once, with the labels the chart itself would apply:
+#
+#   kubectl create namespace csi-proxmox
+#   kubectl label namespace csi-proxmox \
+#     pod-security.kubernetes.io/enforce=privileged \
+#     pod-security.kubernetes.io/audit=baseline \
+#     pod-security.kubernetes.io/warn=baseline
+#
+# then install with neither --create-namespace nor createNamespace.
+createNamespace: false
+
+# ── private registry ───────────────────────────────────────────────────────
+# TOP LEVEL, not under `controller`. The chart reads `.Values.imagePullSecrets`
+# globally (values.yaml line 7) and applies it to both the controller and the
+# node pod. Nesting it under `controller:` renders NOTHING and reports no
+# error — the same silent-miss shape as controller.plugin.image. Verify after
+# templating:
+#   helm template ... | grep -A2 imagePullSecrets
+#
+# Harbor is private, so the controller cannot pull without this, and its
+# absence is quiet in a familiar way: the Deployment sits in ImagePullBackOff
+# and PVCs stay Pending, with the real reason only in the pod's events —
+# nothing in the CSI logs says "I never started".
+#
+# Create it with a Harbor ROBOT account scoped to pull on the
+# ibm-flash-storage-csi project, not a personal login: a robot token is
+# revocable without locking anyone out and carries no push rights.
+#
+#   kubectl -n csi-proxmox create secret docker-registry harbor \
+#     --docker-server=harbor.vmcloud.no \
+#     --docker-username='robot$ibm-flash-storage-csi+k8s' \
+#     --docker-password='<token>'
+#
+# Single-quote the username. Harbor robot names contain a `$`, which the shell
+# would expand to nothing, and the secret then authenticates as an empty user
+# and fails with a 401 that reads exactly like a wrong password.
+imagePullSecrets:
+  - name: harbor
+
+controller:
+  # ── the fork ─────────────────────────────────────────────────────────────
+  # Set this to whatever `make push REGISTRY=...` produced. The tag encodes
+  # both halves of what is inside: the upstream tag it was built from, and
+  # this fork's revision.
+  #
+  # Note the key is controller.plugin.image, NOT a top-level `image`. Getting
+  # that wrong renders a chart that installs the STOCK controller while
+  # looking configured — the snapshotter sidecar comes up, the
+  # VolumeSnapshotClass binds, and snapshots then fail on the shared guard
+  # with no hint that the image is the problem. Verify after templating:
+  #   helm template ... | grep proxmox-csi-flashsystem
+  plugin:
+    image:
+      # harbor.vmcloud.no project `ibm-flash-storage-csi`; the repository
+      # inside it is created by the first `make push`.
+      repository: harbor.vmcloud.no/ibm-flash-storage-csi/proxmox-csi-flashsystem-controller
+      # Empty tag defaults to .Chart.AppVersion, which would be upstream's.
+      # Always set it explicitly.
+      tag: v0.20.0-fs1
+      pullPolicy: IfNotPresent
+
+
+  # ── the snapshotter sidecar ──────────────────────────────────────────────
+  # OFF by default upstream, and its absence is silent in the worst way: the
+  # VolumeSnapshotClass exists, the snapshot-controller accepts the
+  # VolumeSnapshot, and it sits at readyToUse: false indefinitely with nothing
+  # obviously wrong. Nothing logs a reason, because nothing is listening.
+  snapshotter:
+    enabled: true
+    image:
+      repository: registry.k8s.io/sig-storage/csi-snapshotter
+      tag: v8.3.0
+      pullPolicy: IfNotPresent
+    args: []
+
+options:
+  # ── the storageCapacity trap ─────────────────────────────────────────────
+  # Leave this TRUE. templates/csidriver.yaml hardcodes `storageCapacity: true`
+  # on the CSIDriver object, while `--enable-capacity` on csi-provisioner is
+  # gated on this value. Set it false and the driver advertises capacity
+  # tracking with nothing publishing capacity — the scheduler reads that as
+  # "no capacity anywhere" and refuses to place any pod needing a new volume,
+  # so PVCs sit at WaitForFirstConsumer forever with no error.
+  #
+  # Because the CSIDriver field is hardcoded, the only stable resolutions are a
+  # manual kubectl patch after every chart upgrade, or enabling capacity
+  # properly. Enable it properly.
+  enableCapacity: true
+
+# ── storage classes ────────────────────────────────────────────────────────
+# No default class, on purpose: every PVC names its tier. A default class is
+# how five PVCs end up on node-local disk without anyone noticing — which is
+# exactly what happened to a Kasten install here, and it produced no error at
+# any point because the pod that needed no PVC came up healthy.
+#
+# cache: "none" lets the array's own cache do the work. ssd: "true" is honest
+# (it is flash) and also enables discard.
+storageClass:
+  - name: proxmox-gold
+    storage: k8s-gold
+    reclaimPolicy: Delete
+    fstype: ext4
+    cache: none
+    ssd: "true"
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+  - name: proxmox-silver
+    storage: k8s-silver
+    reclaimPolicy: Delete
+    fstype: ext4
+    cache: none
+    ssd: "true"
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+  - name: proxmox-bronze
+    storage: k8s-bronze
+    reclaimPolicy: Delete
+    fstype: ext4
+    cache: none
+    ssd: "true"
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+  - name: proxmox-archive
+    storage: k8s-archive
+    # Retain here and Delete above is deliberate. Archive is the tier a
+    # restore test runs against, and an accidental PVC delete there should not
+    # take the array volume with it.
+    reclaimPolicy: Retain
+    fstype: xfs
+    cache: none
+    ssd: "true"
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer

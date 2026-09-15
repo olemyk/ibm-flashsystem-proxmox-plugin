@@ -40,6 +40,7 @@ use PVE::JSONSchema qw(get_standard_option);
 use PVE::RESTHandler;
 use PVE::RPCEnvironment;
 use PVE::Storage;
+use PVE::Storage::Plugin;
 
 # The storage plugin provides _cmd/_one/_volname_from_array/_pool_usage. On a
 # node it loads by module name; in the unit tests it has already been loaded
@@ -864,7 +865,8 @@ __PACKAGE__->register_method({
     },
     code => sub {
         return [ { subdir => 'health' }, { subdir => 'overview' },
-                 { subdir => 'performance' } ];
+                 { subdir => 'performance' }, { subdir => 'snapshot' },
+                 { subdir => 'volume-from-snapshot' } ];
     },
 });
 
@@ -1176,6 +1178,251 @@ __PACKAGE__->register_method({
         die "storage '$param->{storage}' is not a flashsystem storage\n"
             if ($scfg->{type} // '') ne 'flashsystem';
         return _collect_performance($param->{storage}, $scfg);
+    },
+});
+
+# ---- CSI snapshot surface -------------------------------------------------
+#
+# The reason these exist. A Kubernetes CSI driver needs to create, delete, list
+# and restore array snapshots, and Proxmox exposes no per-volume snapshot verb
+# to carry that: every snapshot endpoint PVE offers is VM-scoped with no disk
+# selector, so a snapshot of the CSI holder VM would capture every PVC on it.
+#
+# The alternative to these endpoints is giving Kubernetes the array's
+# credentials directly. That is worse in four concrete ways, and this is the
+# whole argument for the split:
+#
+#   1. A Storage Virtualize role cannot be scoped to "these volumes". Ownership
+#      groups inherit from CHILD pools and this array has none, and snapshots
+#      are not an ownable object type at all. So the array-side credential is
+#      necessarily broad; a PVE token is ACL-scopeable to /storage/<id>.
+#   2. `fsprefix` would have to cross into Kubernetes and stay in step with
+#      storage.cfg, making the naming contract load-bearing in two codebases.
+#   3. Any leaked array credential that can snapshot can also
+#      `restorefromsnapshot` — which destroys data WITHOUT deleting an object,
+#      so it trips no capacity or object-count monitoring.
+#   4. Kanister job pods run in the PROTECTED APPLICATION's namespace, so a
+#      blueprint holding array credentials mounts them into a pod in every
+#      namespace it backs up.
+#
+# All four are writes, so all four require Datastore.Allocate rather than the
+# Datastore.Audit the reporting endpoints accept. protected => 1 because
+# resolving the REST credential reads root-only /etc/pve/priv/storage/<id>.pw.
+
+# Resolve and validate the storage once, the way every endpoint here needs it.
+# Serialise the mutating CSI endpoints cluster-wide.
+#
+# Every write here is read-then-act: create probes lsvolumesnapshot for an
+# existing row before addsnapshot, delete resolves an id before rmsnapshot,
+# restore resolves a source before mkvolume. Storage Virtualize snapshot names
+# are NOT system-unique, so two concurrent CreateSnapshots for the same CSI
+# name both see "absent" and both succeed - leaving two array objects with the
+# same name, of which csi_snapshot_delete can only ever remove the first. The
+# second holds physical capacity that Kubernetes has no object for.
+#
+# That is not a theoretical race: external-snapshotter retries CreateSnapshot
+# on any error, including a read-back that timed out after addsnapshot had
+# already taken effect.
+#
+# cluster_lock_storage with $shared = 1 takes /etc/pve/priv/lock/storage-<id>
+# through pmxcfs, so it holds across all 12 nodes rather than per-node -
+# which is what this needs, since the driver may reach any node.
+sub _fs_locked {
+    my ($storeid, $scfg, $code) = @_;
+    # PVE::Storage::Plugin->cluster_lock_storage - a CLASS METHOD on the
+    # plugin base class, not a function in PVE::Storage. An earlier cut called
+    # PVE::Storage::cluster_lock_storage, which does not exist anywhere in
+    # PVE, and every API test passed anyway because the test stub had defined
+    # the invented function. It failed on the first real CreateSnapshot with
+    # "Undefined subroutine &PVE::Storage::cluster_lock_storage".
+    #
+    # Verified against /usr/share/perl5/PVE/Storage/Plugin.pm:759 on a node:
+    #   sub cluster_lock_storage {
+    #       my ($class, $storeid, $shared, $timeout, $func, @param) = @_;
+    #
+    # $shared true  -> PVE::Cluster::cfs_lock_storage, i.e. through pmxcfs, so
+    #                  the lock holds across all 12 nodes. This is the case
+    #                  that matters: our storages are all shared 1, and the
+    #                  driver may reach any node.
+    # $shared false -> a local flock under /var/lock/pve-manager.
+    # It dies on the inner code's error rather than swallowing it, so a failed
+    # snapshot still surfaces to the caller.
+    return PVE::Storage::Plugin->cluster_lock_storage(
+        $storeid, $scfg->{shared}, undef, $code);
+}
+
+sub _fs_scfg {
+    my ($storeid) = @_;
+    my $cfg = PVE::Storage::config();
+    my $scfg = PVE::Storage::storage_config($cfg, $storeid);
+    die "storage '$storeid' is not a flashsystem storage\n"
+        if ($scfg->{type} // '') ne 'flashsystem';
+    die "storage '$storeid' does not have array snapshots enabled"
+        . " (set 'fssnapshots 1' after validating firmware)\n"
+        if !$scfg->{fssnapshots};
+    return $scfg;
+}
+
+my $PLUGIN = 'PVE::Storage::Custom::FlashSystemPlugin';
+
+__PACKAGE__->register_method({
+    name => 'snapshot_list',
+    path => '{storage}/snapshot',
+    method => 'GET',
+    description => "List array snapshots belonging to this storage. Scoped to the "
+        . "storage's fsprefix, so the rest of the array's snapshot namespace - the "
+        . "PVE VM estate's and any other consumer's - is not reported. Pass volname "
+        . "to narrow to one volume. This is also the read half of orphan "
+        . "reconciliation: the CSI driver's own ListSnapshots is unimplemented "
+        . "upstream, so without this there is no way to diff array state against "
+        . "VolumeSnapshotContent objects.",
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => [ 'perm', '/storage/{storage}', [ 'Datastore.Audit', 'Datastore.Allocate' ], any => 1 ],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node    => get_standard_option('pve-node'),
+            storage => get_standard_option('pve-storage-id'),
+            volname => { type => 'string', optional => 1,
+                description => 'Restrict to snapshots of this volume.' },
+        },
+    },
+    returns => { type => 'array', items => { type => 'object' } },
+    code => sub {
+        my ($param) = @_;
+        my $scfg = _fs_scfg($param->{storage});
+        return $PLUGIN->csi_snapshot_list($scfg, $param->{storage}, $param->{volname});
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'snapshot_create',
+    path => '{storage}/snapshot',
+    method => 'POST',
+    description => "Create an array snapshot of one volume, named deterministically "
+        . "from the caller's snapshot name. IDEMPOTENT by that name: calling twice "
+        . "returns the same snapshot rather than creating a second one, which is "
+        . "what CSI CreateSnapshot requires of a retry. Refuses with ALREADY_EXISTS "
+        . "when the derived array-side name is already in use by a DIFFERENT volume, "
+        . "rather than aliasing two snapshots onto one array object.",
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => [ 'perm', '/storage/{storage}', [ 'Datastore.Allocate' ] ],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node    => get_standard_option('pve-node'),
+            storage => get_standard_option('pve-storage-id'),
+            volname => { type => 'string',
+                description => 'Volume to snapshot, e.g. vm-9999-pvc-<uuid>.' },
+            name    => { type => 'string', maxLength => 256,
+                description => "The caller's snapshot name, e.g. the CSI "
+                    . "snapshot-<uuid>. Only its digest reaches the array: the "
+                    . "63-character object-name cap leaves 9 characters for a "
+                    . "snapshot name on a 4-character fsprefix." },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $scfg = _fs_scfg($param->{storage});
+        return _fs_locked($param->{storage}, $scfg, sub {
+            return $PLUGIN->csi_snapshot_create(
+                $scfg, $param->{storage}, $param->{volname}, $param->{name});
+        });
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'snapshot_delete',
+    path => '{storage}/snapshot',
+    method => 'DELETE',
+    description => "Delete one array snapshot by its array-side name. IDEMPOTENT on "
+        . "absence, which CSI DeleteSnapshot requires. Refuses to touch a snapshot "
+        . "outside this storage's fsprefix, or one the array cannot positively "
+        . "attribute to the owning volume - snapshot names are not system-unique on "
+        . "Storage Virtualize, and this array's namespace is shared.",
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => [ 'perm', '/storage/{storage}', [ 'Datastore.Allocate' ] ],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node     => get_standard_option('pve-node'),
+            storage  => get_standard_option('pve-storage-id'),
+            snapname => { type => 'string', maxLength => 63,
+                description => 'Array snapshot object name, as returned by the '
+                    . 'create or list endpoints.' },
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $scfg = _fs_scfg($param->{storage});
+        return _fs_locked($param->{storage}, $scfg, sub {
+            return $PLUGIN->csi_snapshot_delete($scfg, $param->{storage}, $param->{snapname});
+        });
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'volume_from_snapshot',
+    path => '{storage}/volume-from-snapshot',
+    method => 'POST',
+    description => "Create a NEW volume pre-populated from an existing array "
+        . "snapshot, and return its PVE volume name. This is the restore half of CSI: "
+        . "CreateVolume with a snapshot content source. The array does the "
+        . "population (mkvolume -type thinclone|clone), and because list_images "
+        . "enumerates the array rather than local metadata, the result is visible to "
+        . "PVE immediately with nothing else to update.\n\n"
+        . "Validated on hardware 2026-09-14/15 (Storage Virtualize 8.7): write, "
+        . "snapshot, restore, attach on a different node, byte-identical read-back. "
+        . "Gated per storage by 'fsrestore', default off - run "
+        . "tools/probe-clone-from-snapshot.sh on your own array first.",
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => [ 'perm', '/storage/{storage}', [ 'Datastore.Allocate' ] ],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node     => get_standard_option('pve-node'),
+            storage  => get_standard_option('pve-storage-id'),
+            snapname => { type => 'string', maxLength => 63,
+                description => 'Array snapshot object name to populate from.' },
+            volname  => { type => 'string', optional => 1,
+                description => 'Name for the NEW volume. A CSI driver has already '
+                    . 'minted this and embedded it in the PersistentVolume\'s '
+                    . 'volumeHandle before asking for the restore, so it must be '
+                    . 'honoured rather than replaced. Must match the plugin\'s '
+                    . 'volume-name grammar and must not already exist.' },
+            vmid     => get_standard_option('pve-vmid', {
+                optional => 1,
+                description => 'Owner VMID, used to derive a free volume name when '
+                    . 'volname is not given. For CSI volumes the driver\'s holder id '
+                    . '(9999 by default) - the placeholder every PVC volume is named '
+                    . 'under. Exactly one of volname or vmid is required.' }),
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $scfg = _fs_scfg($param->{storage});
+        die "exactly one of 'volname' or 'vmid' is required\n"
+            if defined($param->{volname}) == defined($param->{vmid});
+        return _fs_locked($param->{storage}, $scfg, sub {
+            return $PLUGIN->csi_volume_from_snapshot(
+                $scfg, $param->{storage}, $param->{snapname},
+                volname => $param->{volname}, vmid => $param->{vmid});
+        });
     },
 });
 

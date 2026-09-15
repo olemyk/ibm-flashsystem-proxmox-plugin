@@ -1,6 +1,16 @@
 #!/bin/sh
 # Syntax-check and unit-test the FlashSystem plugin.
-# Runs anywhere perl exists — PVE's modules are stubbed in ./stub.
+#
+# Runs anywhere perl exists. ./stub holds PVE's own modules AND the plugin's
+# non-core CPAN dependencies — JSON, LWP::UserAgent, HTTP::Request. The last
+# three are installed on every node by flashsystem_plugin_packages but are NOT
+# on a bare CI runner, and `use` runs at BEGIN, so their absence killed the
+# very first command below before a single case ran. If you add a non-core
+# `use` to the plugin, add a stub for it in ./stub at the same time, or the
+# pipeline finds out for you.
+#
+# Because ./stub is FIRST on @INC, these shims win even on a machine that has
+# the real modules — deliberately, so the suite behaves the same everywhere.
 # Dual-home: works from a vendored layout (module in ../files/)
 # and from the standalone repo (module in ../).
 set -eu
