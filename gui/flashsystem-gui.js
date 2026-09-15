@@ -10,7 +10,7 @@
 // It is appended to /usr/share/pve-manager/js/pvemanagerlib.js by
 // install-flashsystem-gui.sh, which also installs an APT post-invoke hook to
 // re-append it after pve-manager upgrades (those rewrite that file). Run the
-// installer on EVERY node. See README.md ("GUI add/edit").
+// installer on EVERY node. See UPSTREAM.md section 2 ("GUI Add/Edit dialogs").
 //
 // Field/idiom conventions mirror PVE 9.x PVE.storage.CIFSInputPanel:
 //   - fixed-on-edit fields render as a textfield on create, displayfield on edit
@@ -428,7 +428,7 @@ Ext.define('PVE.storage.FlashSystemConfigOverride', {
 });
 
 // ---------------------------------------------------------------------------
-// LOCAL PATCH (performance + consumption, see UPSTREAM.md section 3): shared
+// LOCAL PATCH (performance + consumption, see UPSTREAM.md section 4): shared
 // rendering for the sections that appear in BOTH the storage tab and the
 // datacenter overview — ranked volume/VM consumption and array performance.
 //

@@ -1382,8 +1382,10 @@ __PACKAGE__->register_method({
         . "population (mkvolume -type thinclone|clone), and because list_images "
         . "enumerates the array rather than local metadata, the result is visible to "
         . "PVE immediately with nothing else to update.\n\n"
-        . "NOT YET VALIDATED ON HARDWARE: mkvolume is the one command family this "
-        . "plugin had never issued. Run tools/probe-clone-from-snapshot.sh first.",
+        . "Validated on hardware 2026-09-14/15 (Storage Virtualize 8.7): write, "
+        . "snapshot, restore, attach on a different node, byte-identical read-back. "
+        . "Gated per storage by 'fsrestore', default off - run "
+        . "tools/probe-clone-from-snapshot.sh on your own array first.",
     protected => 1,
     proxyto => 'node',
     permissions => {

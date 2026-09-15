@@ -4,9 +4,16 @@ A thin fork of `proxmox-csi-plugin` that makes `kubectl`-native
 `VolumeSnapshot` work against IBM FlashSystem volumes served through Proxmox,
 plus the Helm values and manifests to install and test it.
 
-**Status: unvalidated against hardware.** The snapshot half rests on array
-commands already running in production; the *restore* half rests on `mkvolume`,
-which this project has never issued. See [Before you trust it](#before-you-trust-it).
+**Status: proven end to end on hardware, 2026-09-14/15.** On cluster pmcl01
+(PVE 9.2, Storage Virtualize 8.7, FC dual-fabric multipath), on both Kubernetes
+tiers: write into a PVC → `VolumeSnapshot` (`readyToUse` in ~5s) → restore into
+a new PVC through `mkvolume` → attach on a **different** Proxmox host than the
+source → read the bytes back identical → delete. Kasten K10 drives the snapshot
+half in production today.
+
+Restore still ships **disabled**, per storage. See
+[Before you trust it](#before-you-trust-it) for what that run did and did not
+settle.
 
 ---
 
@@ -193,23 +200,38 @@ Split by what it rests on, because the two halves are not equally risky.
 **Snapshot create / delete / list** use `addsnapshot`, `rmsnapshot` and
 `lsvolumesnapshot` — in production on this fleet since 2026-08-12. Low risk.
 
-**Restore** uses `mkvolume`, the one command family the storage plugin has never
-issued; it deliberately chose `mkvolume`'s older sibling for allocation. Every
-documented data-reduction-pool restriction on `mkvolume` concerns parameters
-this call does not pass — but "documented as unrestricted" is worth exactly what
-the `-warning` rejection was worth, which is to say a wasted afternoon.
+**Restore** uses `mkvolume` — the command family the storage plugin had never
+issued before this work; it deliberately chose `mkvolume`'s older sibling for
+allocation. It first reached the array on 2026-09-14 and the whole chain has
+since run, including the cross-host case, on both tiers. Every documented
+data-reduction-pool restriction on `mkvolume` concerns parameters this call
+does not pass, and the call was accepted — but on tiers whose pool type is not
+recorded here, so the data-reduction-pool case stays open (ROADMAP §8,
+question 1), and that is evidence about *this* array either way.
+"Documented as unrestricted" is still worth exactly what the `-warning`
+rejection was worth, which is to say a wasted afternoon.
+
+Three things that run did **not** settle, and they are the reason the flag
+stays:
+
+- Only `thinclone` was exercised. `fsclonetype: clone` starts a background
+  copy at IBM's default 2 MB/s and nothing here polls it to completion.
+- Only the CSI caller was exercised. `clone_image` — Proxmox's own `qm clone
+  --snapshot --full 0` — is the same array command behind a different guard
+  with PVE's clone plumbing on top, and has never run.
+- One array, one firmware level, one pool configuration.
 
 So it ships **disabled**, behind its own flag rather than behind a README
 sentence:
 
 ```bash
-pvesm set k8s-archive --fsrestore 1      # only after the probe passes
+pvesm set k8s-archive --fsrestore 1      # after probe-clone-from-snapshot.sh passes on YOUR array
 ```
 
 Until that is set, `CreateVolume` from a snapshot fails with a message naming
 the probe script. Snapshot create/delete/list work regardless — the two halves
-are gated separately on purpose, so enabling the proven half does not enable
-the unproven one.
+are gated separately on purpose, so a new array can run the snapshot half while
+its own restore probe is still outstanding.
 
 **`fsreapsnapshots` is also off by default**, and should stay off. When the
 array refuses to delete a volume because it still has snapshots, the default is
@@ -228,6 +250,62 @@ Two behaviours to know before relying on this:
 - **Expanding a volume invalidates rollback** for every snapshot it already
   had: the array requires the same virtual capacity, and
   `allowVolumeExpansion` is on for every tier here.
+
+## What consumes this: Kasten K10
+
+The reason this exists is not `kubectl`. It is that **the hypervisor cannot
+back up a PVC**, and pretending otherwise is how people lose data.
+
+A Proxmox-level backup of the CSI holder VM captures that VM's own disks. The
+PVCs are separate array volumes, attached and detached as Kubernetes schedules
+pods, and on a 12-node cluster a given PVC is on whichever node its pod landed
+on this hour. There is no hypervisor-level operation that means "back up the
+data inside this Kubernetes cluster" — the boundary is real, and the answer is
+not to work around it but to put a Kubernetes-aware tool on the other side of
+it. Here that is **Kasten K10**, a Veeam product.
+
+```
+Kasten K10 policy
+  └─ VolumeSnapshot ──▶ csi-snapshotter ──▶ CreateSnapshot (this fork)
+                                              └─ PVE API ──▶ addsnapshot
+                                                    (IBM FlashSystem)
+```
+
+K10 gets application consistency, namespace scoping, schedules, retention and
+export; the array gets asked for a snapshot and does it instantly and space
+efficiently. Neither has to understand the other. What appears on the array is
+an ordinary snapshot object:
+
+```
+k8ss-vm-9999-pvc-49b7851a-....3n4asde7l    state: active
+```
+
+Two things about that name are worth knowing before you set a policy.
+
+**It is exactly 63 characters, and that is not a coincidence.** `k8ss` is the
+storage's `fsprefix`, `vm-9999-pvc-<uuid>` is what the CSI driver calls the
+volume, and the trailing 9 characters are a deterministic digest of the CSI
+snapshot name. Prefix(4) + `-` + volname(48) + `.` + digest(9) = 63, the
+Storage Virtualize object-name cap exactly (`tests/t_names.pl` pins it).
+
+**So the prefix length is a hard constraint on Kubernetes tiers.** A 6-char
+`fsprefix` puts the name at 65, and the plugin's own length gate refuses every
+snapshot in the policy before the REST call — with a "max 63 ... use a shorter
+fsprefix" error, not the array's `CMMVC5738E`. Keep `fsprefix`
+at 4 characters on any storage Kubernetes will snapshot. This is why the name
+budget in `UPSTREAM.md` §1c is written the way it is.
+
+### One caveat when validating with kubestr
+
+`kubestr` is the usual first thing people reach for, and its CSI checker gives
+up waiting for a volume after **60 seconds**. Attach on this stack measures
+**60–75s** end to end — the array has to publish the LUN, the node has to
+rescan the full FC range, and udev has to settle a device on a node that may
+carry hundreds of them.
+
+So kubestr can report a failure on a path that works. Measured here: 1m11.7s,
+then 1m0.028s after `multipath -F`. Trust the smoke test in `deploy/` over
+kubestr's verdict — it compares restored bytes rather than racing a timer.
 
 ## Rebasing
 

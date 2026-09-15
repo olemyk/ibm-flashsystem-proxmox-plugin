@@ -3,12 +3,33 @@
 Pre-release history, condensed from internal deployment tags. Dates are when
 the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
-## Unreleased — 2026-09-10
+## Unreleased — 2026-09-10 → 2026-09-15
 
 Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
 `proxmox-csi-plugin` (`csi/`), and the Helm bundle to install and test it.
-**Unvalidated against hardware.**
 
+**Validated against hardware 2026-09-14/15.** On pmcl01 (12 nodes, PVE 9.2,
+Storage Virtualize 8.7), on both Kubernetes tiers: write into a PVC →
+`VolumeSnapshot` (`readyToUse` in ~5s) → restore into a new PVC through
+`mkvolume` → attach on a **different** Proxmox host than the source → read the
+bytes back identical → delete, with the array-side object gone. Kasten K10
+now drives the snapshot half in production.
+
+Not covered by that run, and still gated: `clone_image` (the `qm clone
+--snapshot` caller), `fsclonetype: clone`, and probe questions 2, 4 and 5.
+Question 1 — the data-reduction-pool case — turns on a pool type this repo
+does not record. See ROADMAP §8.
+
+- **Two answers from IBM, 2026-09-15.** The **63-character object-name cap**
+  is confirmed with CLI evidence (`chvdisk -name` at 64 chars returns
+  `CMMVC5738E`, 63 is accepted) — it is the general SAN Volume Controller /
+  FlashSystem rule, and the CSI name budget is built on exactly that number.
+  The **`*_ms` statistics are milliseconds**: on 9.1.0.2 `mdisk_ms 10.103` is
+  10.103 ms and `drive_ms 0.790` is 790 µs, and an 8.3.1.10 V7000 reports the
+  same fields as integers. Both had been open questions since 2026-08-26; the
+  latency tiles were deliberately rendered **unlabelled** until now and are
+  labelled `(ms)` from this release. Attested on 9.1.0.2 and 8.3.1.10 — this
+  fleet runs 8.7.x, between them.
 - **Four CSI endpoints** under `/nodes/{node}/flashsystem/{storage}/` —
   snapshot create/list/delete and volume-from-snapshot. The CSI driver calls
   them with its **existing Proxmox token**, so no array credential enters
@@ -31,12 +52,14 @@ Kubernetes CSI snapshot support: four new PVE API endpoints, a thin fork of
   a **different** volume is refused with `ALREADY_EXISTS` rather than aliased:
   aliasing would return a handle pointing at another PVC's snapshot.
 - **`fsrestore`, default off.** The restore path rests on `mkvolume`, which
-  this plugin has never issued. Gated separately from `fssnapshots` so
-  enabling the production-proven half does not enable the unproven one. It
-  gates **both** `mkvolume` call sites — `csi_volume_from_snapshot` *and*
-  `clone_image`. Gating only the first left `qm clone <vmid> <new> --snapshot
-  <s> --full 0` issuing the unvalidated command with the flag at its default,
-  on a fleet where `fssnapshots` has been on since 2026-08-12.
+  this plugin had never issued before this work and which first reached the
+  array on 2026-09-14. Gated separately from `fssnapshots`, and it stays that
+  way now that both halves are proven here: proven on one array at one
+  firmware level is not proven on the next. It gates **both** `mkvolume` call
+  sites — `csi_volume_from_snapshot` *and* `clone_image`. Gating only the
+  first left `qm clone <vmid> <new> --snapshot
+  <s> --full 0` issuing `mkvolume` with the flag at its default, on a fleet
+  where `fssnapshots` has been on since 2026-08-12.
   `volume_has_feature` also stops advertising `clone` while the gate is
   closed, so qemu-server refuses before the plugin is reached.
 - **`fsreapsnapshots`, default off.** Previously `free_image` always reaped a

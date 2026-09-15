@@ -27,8 +27,8 @@
 #    This step needs BOTH `pvesm set k8s-archive --fsrestore 1` AND
 #    tools/probe-clone-from-snapshot.sh having passed on the array. Without
 #    the flag, fs-smoke-restored stays Pending with a provisioner event naming
-#    the probe — that is the gate working, not a fault. mkvolume is the one
-#    command family the storage plugin has never issued against this array.
+#    the probe — that is the gate working, not a fault. The flag is not a
+#    formality: it is what keeps `mkvolume` off an array nobody has probed.
 #
 # Cleanup is step 4 in smoke-test.yaml, and its ORDER matters — read it there.
 

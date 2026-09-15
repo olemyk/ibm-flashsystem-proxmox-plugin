@@ -60,9 +60,15 @@ STATUS
 
 CreateSnapshot / DeleteSnapshot / ListSnapshots rest on array primitives that
 are already in production (addsnapshot, rmsnapshot, lsvolumesnapshot).
-CreateVolume-from-snapshot rests on mkvolume, which is the one command family
-the storage plugin had never issued - see tools/probe-clone-from-snapshot.sh in
-the plugin repository, which must pass before the restore path is trusted.
+CreateVolume-from-snapshot rests on mkvolume, which the storage plugin had
+never issued before this work and which first reached the array on 2026-09-14.
+The whole chain has since run end to end on Storage Virtualize 8.7: write into
+a PVC, VolumeSnapshot (readyToUse in ~5s), restore into a new PVC, attach on a
+DIFFERENT Proxmox host than the source, read the bytes back identical.
+
+The restore path is still gated per storage by 'fsrestore', default off - see
+tools/probe-clone-from-snapshot.sh in the plugin repository, which is what
+answers the same questions on an array that is not this one.
 */
 
 package csi
@@ -320,7 +326,8 @@ func FSListSnapshots(
 // Proxmox immediately with nothing else to update - which is what makes the
 // restore path cheap.
 //
-// NOT YET HARDWARE-VALIDATED: this is the one call that rests on mkvolume.
+// Hardware-validated 2026-09-14/15 on Storage Virtualize 8.7 - thinclone only,
+// and still gated per storage by 'fsrestore', default off. See STATUS above.
 func FSVolumeFromSnapshot(
 	ctx context.Context,
 	cl *goproxmox.APIClient,

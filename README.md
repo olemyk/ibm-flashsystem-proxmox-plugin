@@ -8,8 +8,10 @@ devices over Fibre Channel.
 
 Originally based on the plugin sample in IBM's *Storage Virtualize + Proxmox
 VE* whitepaper, then extended and hardened in production. Every deviation from
-the original sample exists because something broke without it; the details are
-in [CHANGELOG.md](CHANGELOG.md) and the code comments.
+the original sample in `FlashSystemPlugin.pm` exists because something broke
+without it; the reporting surfaces in `api/` and `gui/` are additions — see the
+state table below. Details in [CHANGELOG.md](CHANGELOG.md) and the code
+comments.
 
 ## Status
 
@@ -33,7 +35,9 @@ work), snapshot-as-block-device, cross-VM volume reassignment via
 `qm disk move --target-vmid` (attach-by-volid works).
 
 **Clone from a snapshot** *is* implemented (array-side `mkvolume`, see
-`fsclonetype`) but has not yet been run against hardware.
+`fsclonetype`). The array command is proven through the CSI restore path
+(2026-09-14/15); PVE's own caller — `clone_image`, `qm clone --snapshot` — and
+`fsclonetype: clone` have not been run against hardware.
 
 ### What that validation does and does not cover
 
@@ -49,18 +53,24 @@ error and can therefore look like a working panel with nothing in it.
 | Health API + storage-view tab | Validated on a FlashSystem 5200 / 8.7.0.3 — all five sections returned content and every whitelisted field name matched |
 | Thin provisioning (`fsthin`) | Validated on a **standard** pool (5200 / 8.7.0.3): 100 GiB presented, 5 GiB real, autoexpand confirmed growing on write |
 | Thin provisioning on a **data reduction pool** | Diagnosed live (5200 / 8.7.0.3): a DRP rejects `-warning` only (`CMMVC9236E`), which the plugin now omits there. The corrected parameter set is **not yet re-run on hardware** |
-| Clone from snapshot (`clone_image`, `fsclonetype`) | **Not validated — `mkvolume` has never been issued against an array.** Run `tools/probe-clone-from-snapshot.sh` first |
+| Restore from snapshot, CSI path (`csi_volume_from_snapshot`) | Validated 2026-09-14/15 on pmcl01 / 8.7: write → snapshot → restore → attach on a **different** node → byte-identical read-back, on both Kubernetes tiers. `thinclone` only |
+| Clone from snapshot, PVE path (`clone_image`, `qm clone --snapshot`) | **Not validated** — same array command, different caller and guard. Run `tools/probe-clone-from-snapshot.sh` first |
+| `fsclonetype: clone` (independent copy) | **Not validated** — nothing here has watched a background copy finish |
 | Datacenter overview panel | **Unit coverage only** |
 | Performance endpoint (`lsnodestats`, `lssystemstats`, `lsthrottle`, `-history`) | **Unit coverage only** |
 | Per-volume consumption + `lssevdiskcopy` fill | **Unit coverage only** |
 | Server-side `lseventlog` alert filter | **Unit coverage only** — falls back to the previous form if a firmware rejects it, and detects a firmware that ignores it |
 
-Three specific unknowns the first hardware run is designed to settle, all
-documented in `UPSTREAM.md` section 4: whether `lssystemstats` is reachable
-over REST at all (it is absent from IBM's published OpenAPI schema for 8.7.0
-and 9.1.3 while `/lsnodestats` is present, so a derived fallback ships either
-way), which unit the `*_ms` statistics actually use, and whether the
-`lseventlog` alert parameters are honoured or silently ignored.
+Two specific unknowns remain for the first hardware run of these panels:
+whether `lssystemstats` is reachable over REST at all (it is absent from IBM's
+published OpenAPI schema for 8.7.0 and 9.1.3 while `/lsnodestats` is present,
+so a derived fallback ships either way — `UPSTREAM.md` section 4), and whether
+the `lseventlog` alert parameters are honoured or silently ignored
+(`UPSTREAM.md` section 3, "Cheaper alerts").
+
+The third — which unit the `*_ms` statistics use — was **answered by IBM on
+2026-09-15** with array output rather than documentation: they are
+milliseconds, and the panel now labels them so. See `UPSTREAM.md` section 4.
 
 ## Layout
 
@@ -187,6 +197,8 @@ exactly.
 | `fsiogrp` | no | I/O group for new volumes (default `io_grp0`) |
 | `fssnapshots` | no | enable array snapshots (firmware ≥ 8.5.1) |
 | `fsthin` | no | thin-provision **new** volumes (`mkvdisk -rsize 2% -autoexpand`; `-warning 80%` on standard pools only) |
+| `fsrestore` | no | allow creating volumes FROM snapshots (`mkvolume -fromsnapshotid`) — gates both the CSI restore path and `clone_image`; default off, per storage |
+| `fsreapsnapshots` | no | when a delete is refused because the volume still has snapshots, destroy them and retry; default off |
 | `fsclonetype` | no | array volume type for clone-from-snapshot: `thinclone` (default) or `clone` |
 
 The standard PVE storage options `content`, `shared`, `nodes` and `disable`
@@ -207,10 +219,12 @@ or touch anything outside their own prefix. Rules that follow:
 - Array object names cap at **63 characters**, shared by
   `prefix + '-' + volname + '.' + snapshot-name`. The longest *common*
   volname is Kubernetes CSI's `vm-9999-pvc-<uuid>` at 48 chars — so keep
-  prefixes ≤ 14 chars, and much shorter on storages that need both CSI
-  volumes and snapshots (state volumes with long snapshot names can exceed
-  48). The plugin refuses oversize creations with an actionable error
-  instead of an opaque CMMVC.
+  prefixes ≤ 14 chars on a storage that only holds volumes, and ≤ 4 on any
+  storage Kubernetes will snapshot: prefix + `-` + 48 + `.` + a 9-char digest
+  is exactly 63 (state volumes with long snapshot names can exceed 48 too).
+  The plugin refuses oversize creations with an actionable error instead of an
+  opaque CMMVC — length only; it does not check the name's charset or first
+  character, and `fsprefix` is fixed at storage creation.
 - PVE-side volume names stay canonical (`vm-<vmid>-…`); the prefix exists
   only on the array.
 
@@ -246,7 +260,7 @@ enabling it on pools shared with other workloads. `fsthin 0` is **not** a
 rollback — it affects new volumes only; convert existing ones online
 array-side with `addvdiskcopy -autodelete`.
 
-### Clone from snapshot (`fsclonetype`) — implemented, not yet validated
+### Clone from snapshot (`fsclonetype`)
 
 With `fssnapshots 1` **and `fsrestore 1`** the plugin advertises PVE's `clone`
 feature **from a snapshot**, and implements it array-side:
@@ -257,8 +271,8 @@ qm snapshot 101 s1
 qm clone 101 102 --snapshot s1 --full 0    # array-side mkvolume; PVE copies nothing
 ```
 
-Both flags, not just `fssnapshots`. This is `mkvolume`, the same unvalidated
-command family the CSI restore path uses, so it sits behind the same gate —
+Both flags, not just `fssnapshots`. This is `mkvolume`, the same command
+family the CSI restore path uses, so it sits behind the same gate —
 and `volume_has_feature` stops advertising `clone` while that gate is closed,
 so PVE refuses the operation itself rather than offering it and failing inside
 the plugin. Earlier revisions gated only the CSI entry point, which left this
@@ -273,25 +287,83 @@ to update.
 
 | Value | Behaviour |
 |---|---|
-| `thinclone` *(default)* | Instant, near-zero capacity, **permanently dependent** on the source snapshot — deleting that snapshot is deferred, not freed. |
+| `thinclone` *(default)* | Instant, near-zero capacity, **permanently dependent** on the source snapshot — IBM documents removal of that snapshot as deferred rather than freed; not observed on this array (probe assertion K). |
 | `clone` | Independent once a background copy finishes, at IBM's default 2 MB/s — hours per 100 GiB. |
 
 Base images and templates remain **unsupported**: `clone` is advertised only
 *with* a snapshot, because there is no COW layer here.
 
-> **`mkvolume` has never been issued against this array.** It is the one
-> command family the plugin had not used, and the `-warning` rejection above
-> is what "documented as unrestricted" is worth. Run
-> `tools/probe-clone-from-snapshot.sh` on a scratch volume in your slackest
-> pool first: it answers whether the snapshot form works on a loose volume,
-> what a thinclone does to `rmsnapshot`, whether `rmvdisk` succeeds with
-> snapshots present, and whether `restorefromsnapshot` changes `vdisk_UID`.
+> **`mkvolume` works here — but this caller has not been run.** The command
+> family first reached the array on 2026-09-14 through
+> `csi_volume_from_snapshot`, and the whole chain proved out. `clone_image` is
+> a different caller behind a different guard, with PVE's clone plumbing on
+> top, and nothing has driven it end to end.
+>
+> Run `tools/probe-clone-from-snapshot.sh` on a scratch volume in your
+> slackest pool before trusting it on an array that is not this one. Four of
+> its questions are still open even here, because the production run did not
+> exercise them: whether the snapshot form works on a **loose** volume in a
+> data reduction pool, what a thinclone does to `rmsnapshot`, whether
+> `rmvdisk` succeeds with snapshots **present** (`free_image` reaps them
+> first, so a normal delete never asks), and whether `restorefromsnapshot`
+> changes `vdisk_UID`.
 
 Rollback is guarded. `volume_rollback_is_possible` refuses a volume that has
 been **resized since the snapshot was taken**, because the array requires the
 same virtual capacity and would otherwise fail with an opaque CMMVC — which
 also means an ordinary volume expansion invalidates rollback for every
 snapshot that volume already had.
+
+## Kubernetes
+
+Everything above is Proxmox-facing. There is a second consumer, and it changes
+what the plugin has to be good at.
+
+Kubernetes runs as guests on this cluster, with
+[`proxmox-csi-plugin`](https://github.com/sergelogvinov/proxmox-csi-plugin)
+provisioning PVCs. Each PVC is one array volume — the same `mkvdisk`, the same
+multipath device, the same prefix discipline as a VM disk — named
+`vm-9999-pvc-<uuid>` and attached to whichever node the pod was scheduled on.
+That part needs nothing special: PVE's storage layer is the CSI driver's
+backend, and this plugin is PVE's backend.
+
+**Snapshots are where it stops working**, and `csi/` is the answer. Upstream
+refuses CSI snapshots on `shared` storage, correctly — the path it would take
+is a full volume copy that silently no-ops on shared storage. Meanwhile the
+array can snapshot properly and this plugin already drives it; there was just
+no way to reach that from Kubernetes, because **Proxmox exposes no per-volume
+snapshot verb**. Every snapshot endpoint PVE offers is VM-scoped with no disk
+selector, so snapshotting the CSI holder VM would capture every PVC parked on
+it.
+
+So `api/FlashSystemAPI.pm` adds four per-volume endpoints under
+`/nodes/{node}/flashsystem/{storage}/`, and `csi/` is a small patch set that
+makes the CSI driver call them:
+
+```
+VolumeSnapshot
+  └─ csi-snapshotter ──▶ CreateSnapshot (the fork in csi/)
+                            └─ POST /nodes/{node}/flashsystem/{storage}/snapshot
+                                  (PVE API, the driver's EXISTING Proxmox token)
+                                  └─ FlashSystemPlugin.pm ──▶ addsnapshot
+```
+
+**No array credential ever enters Kubernetes.** The array password and the
+storage's `fsprefix` both stay on the Proxmox side, and a PVE token is
+scopeable by ACL to `/storage/<id>` — which a Storage Virtualize role cannot
+be. That matters more than it first looks: any array credential that can
+snapshot can also `restorefromsnapshot`, which destroys data *without deleting
+an object*, so it trips no capacity or object-count monitoring.
+
+The consumer is **Kasten K10** (Veeam), which is what actually takes backups
+of what lives inside Kubernetes — the hypervisor cannot, and the boundary is
+deliberate. K10 drives the snapshot half in production. The restore half was
+validated end to end on 2026-09-14/15 through the CSI smoke path — including
+attach onto a different Proxmox host than the source — not through a K10
+restore policy.
+
+See [`csi/README.md`](csi/README.md) for the design, the install, the smoke
+test and what is still gated.
 
 ## Operational behavior worth knowing
 
@@ -361,22 +433,47 @@ its fields, never report zeros). No array needed.
 3. **REST improvements since 8.7**: documented rate limits, token lifetimes,
    batching, or keep-alive guidance we should adopt instead of the current
    empirical backoff?
-4. **Object-name limits**: is 63 chars the documented cap for volume and
-   snapshot names on all current platforms?
-5. **Licensing of the derived sample**: this plugin started from the sample
+4. ~~**Object-name limits**: is 63 chars the documented cap for volume and
+   snapshot names on all current platforms?~~ **Answered 2026-09-15.** Yes —
+   63 characters, confirmed with CLI evidence: `chvdisk -name` with a 64-char
+   argument returns `CMMVC5738E ... contains too many characters`, and 63 is
+   accepted. It is the general SAN Volume Controller / FlashSystem rule for
+   object names. The name budget here is built on exactly that number.
+5. ~~**Licensing of the derived sample**: this plugin started from the sample
    code in the *Storage Virtualize + Proxmox VE* whitepaper (see
    `UPSTREAM.md`). Under what terms was that sample published, and what does
-   that allow for the licence of this derived work?
+   that allow for the licence of this derived work?~~ **Answered 2026-09-15:**
+   there is no restriction from the sample code. That removes one of the three
+   constraints on this repo's licence; see [License](#license) for the other
+   two.
 6. **`lssystemstats` over REST**: it is documented in the CLI reference but
    absent from the published REST OpenAPI schema for both 8.7.0 and 9.1.3,
    while `/lsnodestats` is present. Is it reachable, and is its absence from
    the schema intentional?
-7. **The `*_ms` unit**: the 8.7 `stat_name` descriptions say microseconds, the
-   attribute table reads as milliseconds, and the Performance statistics page
-   says the CLI always displays microseconds. Which is authoritative? The
-   panel currently renders these values unlabelled rather than guess.
+7. ~~**The `*_ms` unit**: the 8.7 `stat_name` descriptions say microseconds,
+   the attribute table reads as milliseconds, and the Performance statistics
+   page says the CLI always displays microseconds. Which is authoritative?~~
+   **Answered 2026-09-15: milliseconds**, and the attribute table is the
+   correct one. Settled with array output rather than documentation — on
+   9.1.0.2, `mdisk_ms 10.103` is 10.103 ms and `drive_ms 0.790` is 790 µs; an
+   8.3.1.10 V7000 reports the same fields as integers. The panel now labels
+   them `(ms)`. Caveat kept in the code: attested on 9.1.0.2 and 8.3.1.10,
+   while this cluster runs 8.7.x — between them, so ms is the safe reading,
+   but it is an inference across versions.
 
 ## License
 
-To be decided before publication — until a LICENSE file exists, all rights
-reserved.
+Still to be decided — until a LICENSE file exists, all rights reserved.
+
+IBM confirmed on 2026-09-15 that **the whitepaper sample carries no
+restriction**, which removes the constraint that was blocking this. Two
+others remain, and they are the ones that actually pick the licence:
+
+- `FlashSystemPlugin.pm` subclasses `PVE::Storage::Plugin` from Proxmox VE,
+  which is **AGPL-3.0**.
+- `csi/` is a patch set against
+  [`sergelogvinov/proxmox-csi-plugin`](https://github.com/sergelogvinov/proxmox-csi-plugin),
+  and `csi/flashsystem.go` is compiled into that codebase.
+
+Those two are different projects under different licences, so the answer may
+not be a single licence for the whole repository.

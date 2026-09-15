@@ -19,13 +19,15 @@ section 3. Still open within this item:
   performance endpoint, and per-volume fill. The storage tab's original
   sections are validated (8.7.0.3); everything added since has unit coverage
   only.
-- **Three specific probes** the first hardware run should settle:
+- **Two specific probes** the first hardware run should settle:
   (1) is `lssystemstats` reachable over REST v1 on this array — check
   `https://<array>:7443/rest/explorer/`; the derived fallback ships either
-  way. (2) the `*_ms` unit — compare `vdisk_ms` against the array GUI's
-  latency chart at the same moment. (3) does the `lseventlog` alert filter
-  actually apply, or is it silently ignored (the code detects the latter, but
-  confirm which path ran).
+  way. (2) does the `lseventlog` alert filter actually apply, or is it
+  silently ignored (the code detects the latter, but confirm which path ran).
+  A third — the `*_ms` unit — was answered by IBM on 2026-09-15 from array
+  output: **milliseconds**, and the panel labels them. Attested on 9.1.0.2 and
+  8.3.1.10; this fleet runs 8.7.x, between them, so it is an inference across
+  versions — see `UPSTREAM.md` section 4.
 - **Mirrored volumes are missed**: `lsvdisk` is filtered server-side on
   `mdisk_grp_name`, which reports `many` for mirrored volumes, so they fall
   out of pool counts and rankings. The fix is an unfiltered fetch scoped
@@ -113,16 +115,39 @@ convenience, the cost is a wider grammar and more state to reason about.
 The 429 backoff (1/2/4s, Retry-After honored) is empirical. If IBM documents
 the actual limits per firmware (README open question 3), tune to them.
 
-## 8. Hardware validation of clone-from-snapshot — the open gate
+## 8. Hardware validation of clone-from-snapshot — partly closed
 
-`clone_image` and `fsclonetype` ship (UPSTREAM.md §1f), and `mkvolume` is the
-one command family this plugin had never issued. Nothing about it has been
-observed on an array: every documented DRP restriction on `mkvolume` concerns
-parameters this call does not pass, but §1e is exactly what "documented as
-unrestricted" is worth here.
+`mkvolume` was the one command family this plugin had never issued. That is no
+longer true: on 2026-09-14/15 the CSI restore path
+(`csi_volume_from_snapshot`) issued `mkvolume -type thinclone` against pmcl01
+at firmware 8.7 and the whole chain held — write into a PVC, snapshot, restore
+into a new PVC, attach on a **different** Proxmox host, read the bytes back
+identical, then delete. Both Kubernetes tiers.
 
-`tools/probe-clone-from-snapshot.sh` is the gate and answers it in one pass on
-scratch objects. Ordered by what a wrong answer costs:
+What that run did **not** settle, and what keeps this section open:
+
+- **`clone_image` has still never run.** Same array command, different caller,
+  different guard, PVE's own clone plumbing on top (`qm clone --snapshot
+  --full 0`).
+- **`fsclonetype: clone` has never run.** Only `thinclone` was exercised. The
+  independent form starts a background copy at IBM's default 2 MB/s and
+  nothing here polls it to completion — see the scratch-VM follow-ups at the
+  end of this section.
+- **Questions 2, 4 and 5 below are untouched by it** — the run never issued
+  `restorefromsnapshot`, never removed a snapshot a thinclone still depended
+  on, and never exercised `-filtervalue`.
+- **Question 1 depends on the pool type behind the tiers that ran, and that is
+  not recorded anywhere in this repo.** `lsmdiskgrp`'s `data_reduction` value
+  for the pools behind `k8s-archive` and `k8s-silver` would close it or leave
+  it open; until someone writes it down, treat the DRP case as untested.
+- **Question 3 is narrower than it looks.** No ordinary delete asks probe
+  assertion O — whether `rmvdisk` succeeds while snapshots are still
+  *present* — because `free_image` reaps a volume's snapshots before issuing
+  it.
+
+`tools/probe-clone-from-snapshot.sh` remains the gate for any array that is
+not this one, and answers all of it in one pass on scratch objects. Ordered by
+what a wrong answer costs:
 
 1. Does the snapshot form work on a **loose** volume in a **DRP** over REST
    v1? Every IBM example uses a volume group. If not, the plugin has to own

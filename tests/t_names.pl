@@ -1287,7 +1287,7 @@ ok_case('feature copy from snap',   $P->volume_has_feature($fs_on,  'copy', 'S',
         ($@ && $@ =~ /is not a snapshot on storage/) ? 'dies' : "(!? $@)", 'dies');
 
     # fsrestore is a SEPARATE gate from fssnapshots, default off: this path
-    # rests on mkvolume, which has never been issued against an array, while
+    # rests on mkvolume, validated on one array at one firmware level, while
     # create/delete rest on commands in production since 2026-08-12.
     eval { $P->csi_volume_from_snapshot(
         { fsprefix => 'k8ss', fspool => 'P', fssnapshots => 1 },

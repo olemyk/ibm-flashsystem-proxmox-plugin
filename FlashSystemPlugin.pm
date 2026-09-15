@@ -25,11 +25,12 @@ package PVE::Storage::Custom::FlashSystemPlugin;
 # move-disk, resize, snapshots incl. RAM state, delete, Kubernetes CSI
 # volumes. Thin provisioning (fsthin) works on standard pools AND on data
 # reduction pools; the DRP case needs one parameter omitted, see
-# _mkvdisk_params. Clone-from-snapshot (clone_image) is implemented but NOT
-# yet hardware-validated — tools/probe-clone-from-snapshot.sh answers every
-# open question about it in one pass. Search this file for
-# "VALIDATE:" for the remaining environment- and firmware-specific
-# decisions to confirm on YOUR array before production.
+# _mkvdisk_params. Clone-from-snapshot is hardware-validated through the CSI
+# caller (csi_volume_from_snapshot, 2026-09-14/15) but NOT through clone_image,
+# the `qm clone --snapshot` path, which has still never run against an array;
+# tools/probe-clone-from-snapshot.sh answers what remains in one pass. Search
+# this file for "VALIDATE:" for the remaining environment- and
+# firmware-specific decisions to confirm on YOUR array before production.
 # ---------------------------------------------------------------------------
 
 use strict;
@@ -100,7 +101,7 @@ sub properties {
         fssnapshots => { description => 'Enable array snapshots (validate firmware first)', type => 'boolean' },
         fsprefix  => { description => 'Prefix for array-side object names, e.g. the cluster name. Required when several clusters share a pool.', type => 'string' },
         fsthin    => { description => 'Thin-provision new volumes (mkvdisk -rsize 2% -autoexpand, plus -warning 80% on standard pools only). Affects new volumes only; existing ones keep their allocation.', type => 'boolean' },
-        fsrestore => { description => 'Allow creating volumes FROM snapshots (mkvolume -fromsnapshotid). Default off: mkvolume is the one command family this plugin has never issued against an array. Run tools/probe-clone-from-snapshot.sh, then enable.', type => 'boolean' },
+        fsrestore => { description => 'Allow creating volumes FROM snapshots (mkvolume -fromsnapshotid). Validated on Storage Virtualize 8.7 (2026-09-14/15) through the CSI restore path. Default off and gated per storage anyway: proven on one array at one firmware level is not proven on yours - run tools/probe-clone-from-snapshot.sh, then enable.', type => 'boolean' },
         fsreapsnapshots => { description => 'When deleting a volume the array refuses because it still has snapshots, DESTROY those snapshots and retry. Default off: a volume delete should not silently destroy recovery points.', type => 'boolean' },
         fsclonetype => { description => "Array volume type for clone-from-snapshot: 'thinclone' (instant, space-efficient, stays dependent on the source snapshot) or 'clone' (independent once a background copy finishes, consumes full capacity).", type => 'string', enum => [ 'thinclone', 'clone' ], default => 'thinclone' },
     };
@@ -1556,13 +1557,18 @@ sub volume_snapshot_delete {
 # `chvdisk -volumegroup` then `converttoclone` then `chvdisk -novolumegroup`
 # promotes one to independent without this plugin having to own volume groups.
 #
-# VALIDATE: NOT yet run against hardware. mkvolume is the one command family
-# this plugin has never issued, and it was deliberately avoided for
-# allocation (see _mkvdisk_params). Every documented DRP restriction on
-# mkvolume concerns parameters this call does not pass (-warning,
-# -noautoexpand, -grainsize), but "documented as unrestricted" is not
-# "observed working" - the -warning rejection above is precisely what that
-# distinction costs. Run tools/probe-clone-from-snapshot.sh first.
+# VALIDATE: 'thinclone' has run against hardware; 'clone' has not. The CSI
+# restore path issued mkvolume -type thinclone successfully on 2026-09-14/15
+# (pmcl01, firmware 8.7), so this command family is no longer unexercised
+# here - allocation still avoids it deliberately, see
+# _mkvdisk_params. What nothing has watched is 'clone': it starts a background
+# copy at IBM's default 2 MB/s and no caller here polls it to completion, so
+# the progress question in ROADMAP section 8 is still open. Every documented
+# DRP restriction on mkvolume concerns parameters this call does not pass
+# (-warning, -noautoexpand, -grainsize) and the call was accepted - but on a
+# pool whose type is not recorded, so the DRP case stays open; and the
+# -warning rejection above is what "documented as unrestricted" is worth, so
+# run tools/probe-clone-from-snapshot.sh on YOUR array first.
 # The die is a backstop for a hand-edited storage.cfg. properties() declares
 # an enum, and PVE::JSONSchema enforces it, so `pvesm set --fsclonetype junk`
 # is already rejected before it reaches the plugin.
@@ -1616,11 +1622,16 @@ sub clone_image {
         if !$scfg->{fssnapshots};
     # The SECOND mkvolume call site, and it needs the same gate as the first.
     # Gating only csi_volume_from_snapshot left `qm clone <vmid> <new>
-    # --snapshot <s> --full 0` issuing the never-validated mkvolume with
-    # fsrestore at its default -- while properties(), the CHANGELOG and
-    # csi/README all promise that flag is what prevents exactly this.
+    # --snapshot <s> --full 0` issuing mkvolume with fsrestore at its default
+    # -- while properties(), the CHANGELOG and csi/README all promise that
+    # flag is what prevents exactly this.
+    #
+    # This caller has still never run against hardware. The 2026-09-14/15
+    # validation exercised csi_volume_from_snapshot: same array command,
+    # different caller, different guard, and PVE's own clone plumbing on top.
     die "flashsystem: restore-from-snapshot is disabled on '$storeid'."
-        . " mkvolume has not been validated on this array - run"
+        . " mkvolume is validated on 8.7 through the CSI caller only; this"
+        . " clone path has never run against an array - run"
         . " tools/probe-clone-from-snapshot.sh, then set 'fsrestore 1'.\n"
         if !$scfg->{fsrestore};
     # Only the from-snapshot form exists. A linked clone off a base image
@@ -2096,13 +2107,17 @@ sub csi_volume_from_snapshot {
     my ($class, $scfg, $storeid, $snapname, %opt) = @_;
     die "flashsystem: snapshots disabled\n" if !$scfg->{fssnapshots};
     # A SEPARATE gate from fssnapshots, and off by default. Snapshot
-    # create/delete rest on commands that have been in production here since
-    # 2026-08-12; this path rests on mkvolume, which this plugin has never
-    # issued against an array. Shipping both behind one flag would enable the
-    # unvalidated half the moment anyone enables the validated one, and a
-    # README saying "run the probe first" is documentation, not a gate.
+    # create/delete rest on commands in production here since 2026-08-12;
+    # this path rests on mkvolume, which first reached this array on
+    # 2026-09-14 and now carries a full write -> snapshot -> restore ->
+    # attach-on-another-host -> byte-identical read-back behind it.
+    #
+    # The gate stays, and stays separate. Proven on one array at one firmware
+    # level is not proven on the next, and behind a single flag enabling
+    # snapshots would enable restore - while a README saying "run the probe
+    # first" is documentation, not a gate.
     die "flashsystem: restore-from-snapshot is disabled on '$storeid'."
-        . " mkvolume has not been validated on this array - run"
+        . " mkvolume is validated on 8.7 but gated per storage - run"
         . " tools/probe-clone-from-snapshot.sh, then set 'fsrestore 1'.\n"
         if !$scfg->{fsrestore};
     my ($src_volname) = _volname_from_snapname($scfg, $snapname);

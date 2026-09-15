@@ -65,6 +65,28 @@ object-name cap with an actionable error (prefix + volname budget) instead of
 letting `mkvdisk` fail with an opaque CMMVC. The budget is real: a 14-char
 prefix plus the 48-char CSI name shape is exactly 63.
 
+**The cap is vendor-confirmed.** IBM supplied CLI evidence on 2026-09-15 —
+it is the general SAN Volume Controller / FlashSystem rule for object names,
+not a volume-specific quirk:
+
+```
+IBM_2145:svc_cluster01:superuser>chvdisk -name v234567890123456789012345678901234567890123456789012345678901234 test_chars1
+CMMVC5738E The argument [v23456789...0123456] contains too many characters.
+
+IBM_2145:svc_cluster01:superuser>chvdisk -name v23456789012345678901234567890123456789012345678901234567890123 test_chars1
+IBM_2145:svc_cluster01:superuser>
+```
+
+64 refused, 63 accepted. Four sites enforce it — `alloc_image`, `_snap_name`,
+`clone_image` and `csi_volume_from_snapshot` — and the CSI snapshot name
+budget is built on exactly this number: a 4-char prefix + `-` + the 48-char
+`vm-9999-pvc-<uuid>` shape + `.` + a 9-char digest is 63 to the character
+(pinned in `tests/t_names.pl`). It is also why a 6-char prefix cannot serve a
+Kubernetes tier: the name reaches 65 and the plugin's own length gate refuses
+it — with its own "max 63 ... use a shorter fsprefix" message, before any REST
+call goes out, so the array's `CMMVC5738E` above is never what the operator
+sees.
+
 ## 1d. 429 retry + per-cycle status cache
 
 The array throttles its REST API. Steady-state load is real — pvestatd polls
@@ -149,7 +171,7 @@ nicety here; it is the entire alerting story.
 
 Also: `fsthin 0` is **not** a rollback. It affects new volumes only, and
 undoing an existing allocation needs the `addvdiskcopy -autodelete`
-conversion that ROADMAP item 2 still lists as undocumented.
+conversion that ROADMAP item 2 still lists as untested.
 
 This is otherwise consistent with the rest of DRP behaviour: the pool
 already performs its own thin/dedup/compression, so a fully-allocated vdisk
@@ -159,7 +181,7 @@ inside a DRP is not the plain waste it would be on a standard pool.
 before enabling on any pool shared with other workloads — a pool driven to
 physical-full takes every volume in it offline.
 
-## 1f. Clone from snapshot (`clone_image`, `fsclonetype`) — NOT YET VALIDATED
+## 1f. Clone from snapshot (`clone_image`, `fsclonetype`) — CSI path validated
 
 Upstream's sample advertises neither `clone` nor `template`, because it has
 no base-image (COW) support. That stays true: what is added here is the
@@ -179,7 +201,8 @@ Note it is `mkvolume`, not the `mkvdisk` every other allocation here uses —
 `mkvdisk` has no from-snapshot form. Two properties make it fit the existing
 design with nothing else changing:
 
-- **`-name` is the caller's choice** (1–63 alphanumeric), so the derived
+- **`-name` is the caller's choice** (1–63 characters from `A-Za-z0-9_.-`, per
+  the charset `_snap_name` enforces), so the derived
   volume can be given a conforming PVE volname directly; and
 - **`list_images()` enumerates the array**, not any local metadata, so a
   volume created this way appears in `pvesm list` with nothing to update.
@@ -241,15 +264,26 @@ still running, and *that* is the safety contract this plugin relies on —
 which is exactly why an automated caller outside PVE's guest lifecycle must
 not drive rollback.
 
-### Status: implemented, not validated
+### Status: validated through the CSI caller, not through `clone_image`
 
-**`mkvolume` has never been issued against this array.** Every documented DRP
-restriction on it concerns parameters this call does not pass (`-warning`,
-`-noautoexpand`, `-grainsize`), but "documented as unrestricted" is not
-"observed working" — and §1e above is exactly what that distinction costs.
+**`mkvolume` reached this array on 2026-09-14.** The CSI restore path issued
+`mkvolume -type thinclone -fromsnapshotid` against pmcl01 at firmware 8.7, and
+the chain proved out end to end on both Kubernetes tiers: write into a PVC,
+`VolumeSnapshot` (`readyToUse` in ~5s), restore into a new PVC, attach on a
+**different** Proxmox host than the source, read the bytes back identical,
+delete. Every documented DRP restriction on `mkvolume` concerns parameters
+this call does not pass (`-warning`, `-noautoexpand`, `-grainsize`), and the
+call was accepted — but the pool type behind the tiers that ran is not
+recorded here, so this is not yet evidence about a data reduction pool, and
+§1e above is what "documented as unrestricted" is worth in any case.
 
-`tools/probe-clone-from-snapshot.sh` settles it in one pass on scratch
-objects, and answers the rest of the open set at the same time: whether the
+Two callers, one command family, and only one of them has run. `clone_image`
+— the `qm clone <vmid> <new> --snapshot <s> --full 0` path this section
+documents — has **never** been driven end to end, and neither has
+`fsclonetype: clone`, whose background copy nothing here polls to completion.
+
+`tools/probe-clone-from-snapshot.sh` is still the gate for any other array,
+and answers the rest of the open set at the same time: whether the
 snapshot form works on a **loose** volume (every IBM example uses a volume
 group), whether `rmsnapshot` is refused or deferred while a thinclone
 depends on the snapshot, whether a deferred snapshot is still visible to a
@@ -326,6 +360,43 @@ timeout — so polling cannot keep a token warm past it.
 This array has been observed returning 401. Both are now handled, which makes
 one branch dead code rather than a bug either way; handling only 401 would
 turn an hourly token roll into a hard failure for any long-lived consumer.
+
+### Where the token lives — and why not in pmxcfs
+
+The sample keeps its token in a pmxcfs file and decides whether it is still
+valid by comparing the clock against `write_time + token_ttl`. This plugin
+does neither. Tokens live in an in-memory hash, `%TOKENS`, keyed by array
+address and private to each `pvedaemon` / `pvestatd` process. **Nothing here
+ever computes an expiry.** The token is used, and the array's refusal is what
+says it was stale.
+
+That is a deliberate trade, and it costs something: a per-process cache mints
+more tokens than one shared cluster-wide, against an auth endpoint that is
+rate-limited harder than the command endpoints. What it buys is that two
+failure modes cannot happen.
+
+- **A locally computed expiry is a guess about someone else's state.** The
+  array discards every issued JWT when the config node coldstarts — firmware
+  updates, node restarts, T3 recoveries, service restarts. A token minted at
+  08:57 and believed good until 09:57 is worthless at 09:08, and no local
+  arithmetic can know that.
+- **A shared cache turns one stale token into a cluster-wide outage.** If the
+  cache lives in `/etc/pve/`, every node reads the same dead token at the same
+  instant and every storage call fails until someone deletes the file by hand.
+  A per-process cache makes the same event cost one failed round-trip per
+  process, after which it self-heals with no operator action.
+
+The retry is gated on whether the token came *from* the cache (`$cached`), the
+same distinction the expiry approach needs and for the same reason: a fresh
+token drawing the same code was never an expiry, it is an authorization
+refusal. In that case the **first** response is reported, because it carries
+the CMMVC explaining the real cause — the retry's body is a second identical
+403 that hides it.
+
+Reading the JWT's own `exp` claim would be strictly better than the sample's
+configured TTL, and would save this design one failed round-trip per token
+roll. It is not a substitute for a recovery path: a token can die long before
+its `exp`.
 
 ## 2. GUI Add/Edit dialogs
 
@@ -560,15 +631,24 @@ throughput summed across canisters, latency and percentages taken from the
 the panel says where the numbers came from instead of passing an
 approximation off as the array's own figure.
 
-**Latency values are rendered without a unit.** IBM's 8.7 documentation
-contradicts itself on the `*_ms` statistics: the `stat_name` descriptions say
-microseconds, the attribute table reads as milliseconds, and the Performance
-statistics page states the CLI always displays microseconds. Guessing is a
-1000x error in one direction, so the raw value is shown with a note until it
-is compared against the array's own GUI. **VALIDATE**: read `vdisk_ms` and
-check it against the array's volume latency chart at the same moment — on a
-healthy flash array ~0.2–1.0 reads as milliseconds and ~200–1000 as
-microseconds.
+**Latency values are rendered in milliseconds, labelled `(ms)`.** IBM's 8.7
+documentation contradicts itself on the `*_ms` statistics: the `stat_name`
+descriptions say microseconds, the attribute table reads as milliseconds, and
+the Performance statistics page states the CLI always displays microseconds.
+Guessing is a 1000x error in one direction, so these shipped **unlabelled**
+until someone with an array could settle it.
+
+**Resolved 2026-09-15 by IBM, with array output rather than documentation:
+the attribute table is the correct one.** On code level 9.1.0.2,
+`mdisk_ms 10.103` is 10.103 ms and `drive_ms 0.790` is 790 µs — the decimal
+place makes microseconds impossible, since 10.103 µs would be faster than the
+drives underneath it. An older V7000 at 8.3.1.10 reports the same fields as
+integers with no decimal place (`mdisk_w_ms 9`, `drive_r_ms 22`): the same
+unit at lower precision.
+
+**Caveat, deliberately kept**: attested on 9.1.0.2 and 8.3.1.10. This cluster
+runs 8.7.x, which sits between them, so milliseconds is the safe reading — but
+it is an inference across versions, not a direct observation on ours.
 
 **Per-volume performance does not exist and is not implied.** The 8.7 CLI
 reference contains no `ls*` command with per-volume IOPS or latency, the REST

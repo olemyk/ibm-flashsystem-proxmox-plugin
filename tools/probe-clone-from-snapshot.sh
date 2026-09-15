@@ -6,15 +6,21 @@
 #
 # WHY THIS EXISTS
 #
-# `mkvolume` is the one Storage Virtualize command family this plugin has
-# never issued. Allocation deliberately uses `mkvdisk`, and the from-snapshot
-# form of mkvolume is the single primitive the Kubernetes snapshot design
-# requires and nobody here has run. Everything else in that design is either
-# already in production (addsnapshot / rmsnapshot / restorefromsnapshot, live
-# since 2026-08-12) or verifiable without hardware (the naming contract, in
+# `mkvolume` is the one Storage Virtualize command family this plugin did not
+# issue before the CSI work. Allocation deliberately uses `mkvdisk`, and the
+# from-snapshot form of mkvolume is the single primitive the Kubernetes
+# snapshot design requires. Everything else in that design is either already
+# in production (addsnapshot / rmsnapshot / restorefromsnapshot, live since
+# 2026-08-12) or verifiable without hardware (the naming contract, in
 # tests/t_names.pl).
 #
-# So this script is the gate. It answers, with raw response bodies:
+# It has since run on pmcl01 (firmware 8.7, 2026-09-14/15) with the whole
+# chain proving out, so this script is no longer the gate for THIS array. It
+# is still the gate for any other one - a different firmware, a different pool
+# type or a different licence set can answer any of these differently, and
+# several of the questions below were never settled by that run at all.
+#
+# It answers, with raw response bodies:
 #
 #   D  is POST /rest/v1/mkvolume reachable over REST v1 on this firmware?
 #   E  is the snapshot-source form accepted for a LOOSE volume (no volume
