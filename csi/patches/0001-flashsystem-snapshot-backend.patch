@@ -1,0 +1,353 @@
+diff --git a/pkg/csi/controller.go b/pkg/csi/controller.go
+index f56f8eb..f910ac2 100644
+--- a/pkg/csi/controller.go
++++ b/pkg/csi/controller.go
+@@ -60,6 +60,20 @@ var controllerCaps = []csi.ControllerServiceCapability_RPC_Type{
+ 	csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+ 	csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+ 	csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
++	// LIST_SNAPSHOTS is required for the FlashSystem backend, and not merely
++	// so ListSnapshots gets called. external-snapshotter's GetSnapshotStatus
++	// treats an UNADVERTISED LIST_SNAPSHOTS as "assume the snapshot is valid"
++	// and reports ready_to_use=true without asking the driver anything — so a
++	// pre-provisioned VolumeSnapshotContent would be Ready no matter what
++	// state the array snapshot is actually in, and that shortcut is the only
++	// place readiness is decided on that path.
++	//
++	// The trade-off, stated plainly: with the capability advertised,
++	// GetSnapshotStatus against a NON-flashsystem storage now receives our
++	// Unimplemented error instead of the assume-true shortcut. On a
++	// flashsystem-only fleet that is strictly better; on a mixed one it is
++	// still the honest answer.
++	csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
+ 	csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
+ 	csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+ 	csi.ControllerServiceCapability_RPC_GET_VOLUME,
+@@ -189,16 +203,22 @@ func (d *ControllerService) CreateVolume(ctx context.Context, request *csi.Creat
+ 			return nil, err
+ 		}
+ 
+-		if _, err = d.checkVolume(ctx, srcVol); err != nil {
+-			if status.Code(err) == codes.NotFound {
+-				klog.ErrorS(err, "CreateVolume: zone or volume not found", "contentSourceID", srcVol.VolumeID())
++		// FLASHSYSTEM: an array snapshot is not listable PVE content, so
++		// checkVolume would report NotFound and fail a perfectly valid
++		// restore. The array validates the snapshot itself when the restore is
++		// issued further down.
++		if _, isFSSnap := FSArraySnapName(srcVol); !isFSSnap {
++			if _, err = d.checkVolume(ctx, srcVol); err != nil {
++				if status.Code(err) == codes.NotFound {
++					klog.ErrorS(err, "CreateVolume: zone or volume not found", "contentSourceID", srcVol.VolumeID())
+ 
+-				return nil, err
+-			}
++					return nil, err
++				}
+ 
+-			klog.ErrorS(err, "CreateVolume: failed to check volume", "cluster", srcVol.Cluster(), "contentSourceID", srcVol.VolumeID())
++				klog.ErrorS(err, "CreateVolume: failed to check volume", "cluster", srcVol.Cluster(), "contentSourceID", srcVol.VolumeID())
+ 
+-			return nil, err
++				return nil, err
++			}
+ 		}
+ 	}
+ 
+@@ -337,29 +357,53 @@ func (d *ControllerService) CreateVolume(ctx context.Context, request *csi.Creat
+ 		mc := metrics.NewMetricContext("createVolume")
+ 
+ 		if srcVol != nil {
+-			size, err := getVolumeSize(ctx, cl, srcVol)
+-			if err != nil {
+-				if err.Error() != ErrorNotFound {
+-					klog.ErrorS(err, "CreateVolume: failed to check volume", "cluster", region, "volumeID", srcVol.VolumeID())
++			// FLASHSYSTEM: restore array-side. The size probe below cannot see
++			// a snapshot (not listable content) and copyVolume cannot serve one
++			// on shared storage, so both are bypassed. The array does the
++			// population, so nothing streams through Proxmox and the four-minute
++			// task ceiling does not apply.
++			if arraySnap, isFSSnap := FSArraySnapName(srcVol); isFSSnap {
++				if vol.Storage() != srcVol.Storage() {
++					// Kept deliberately, matching upstream: cross-tier restore
++					// would need the target pool to differ from the snapshot's,
++					// and an array snapshot lives in its parent's pool.
++					return nil, status.Errorf(codes.InvalidArgument, "storage mismatch: requested storage %s does not match snapshot storage %s", vol.Storage(), srcVol.Storage())
++				}
+ 
+-					return nil, status.Error(codes.Internal, err.Error())
++				out, ferr := FSVolumeFromSnapshot(ctx, cl, region, vol.Storage(), arraySnap, vol.Disk())
++				if mc.ObserveRequest(ferr) != nil {
++					klog.ErrorS(ferr, "CreateVolume: array restore failed", "cluster", region, "arraySnapshot", arraySnap, "volumeID", vol.VolumeID())
++
++					return nil, status.Error(codes.Internal, ferr.Error())
+ 				}
+ 
+-				return nil, status.Errorf(codes.NotFound, "snapshot %s is not found", srcVol.VolumeID())
+-			}
++				klog.V(3).InfoS("CreateVolume: restored from array snapshot", "cluster", region, "arraySnapshot", arraySnap, "volumeID", vol.VolumeID(), "cloneType", out.CloneType)
++			} else {
+ 
+-			if size == 0 {
+-				return nil, status.Errorf(codes.Unavailable, "snapshot %s is not yet available", srcVol.VolumeID())
+-			}
++				size, err := getVolumeSize(ctx, cl, srcVol)
++				if err != nil {
++					if err.Error() != ErrorNotFound {
++						klog.ErrorS(err, "CreateVolume: failed to check volume", "cluster", region, "volumeID", srcVol.VolumeID())
+ 
+-			klog.V(5).InfoS("CreateVolume: creating volume from snapshot", "volumeID", vol.VolumeID(), "snapshotID", srcVol.VolumeID())
++						return nil, status.Error(codes.Internal, err.Error())
++					}
+ 
+-			if vol.Storage() != srcVol.Storage() {
+-				return nil, status.Errorf(codes.InvalidArgument, "storage mismatch: requested storage %s does not match snapshot storage %s", vol.Storage(), srcVol.Storage())
+-			}
++					return nil, status.Errorf(codes.NotFound, "snapshot %s is not found", srcVol.VolumeID())
++				}
+ 
+-			if err = copyVolume(ctx, cl, srcVol, vol); mc.ObserveRequest(err) != nil {
+-				return nil, status.Error(codes.Internal, err.Error())
++				if size == 0 {
++					return nil, status.Errorf(codes.Unavailable, "snapshot %s is not yet available", srcVol.VolumeID())
++				}
++
++				klog.V(5).InfoS("CreateVolume: creating volume from snapshot", "volumeID", vol.VolumeID(), "snapshotID", srcVol.VolumeID())
++
++				if vol.Storage() != srcVol.Storage() {
++					return nil, status.Errorf(codes.InvalidArgument, "storage mismatch: requested storage %s does not match snapshot storage %s", vol.Storage(), srcVol.Storage())
++				}
++
++				if err = copyVolume(ctx, cl, srcVol, vol); mc.ObserveRequest(err) != nil {
++					return nil, status.Error(codes.Internal, err.Error())
++				}
+ 			}
+ 		} else {
+ 			if err = createVolume(ctx, cl, vol, volSizeBytes); mc.ObserveRequest(err) != nil {
+@@ -822,6 +866,50 @@ func (d *ControllerService) CreateSnapshot(ctx context.Context, request *csi.Cre
+ 		return nil, err
+ 	}
+ 
++	// FLASHSYSTEM: the array can snapshot properly, so serve it here rather
++	// than falling into the shared guard below.
++	//
++	// This MUST precede both the shared check and checkVolume. The shared flag
++	// is load-bearing for these storages - it is what selects the zone-less
++	// volume handle that permits attach on any node - so it cannot be turned
++	// off to get past the guard, and the copy implementation the guard protects
++	// creates nothing on shared storage anyway.
++	if storageConfig.Type == FSPluginType {
++		snap, ferr := FSCreateSnapshot(ctx, cl, vol, name)
++		if ferr != nil {
++			if FSIsAlreadyExists(ferr) {
++				// A deterministic array-side name already belongs to a
++				// DIFFERENT volume. Aliasing them would return a handle
++				// pointing at another PVC's snapshot, so this is a hard
++				// refusal, and ALREADY_EXISTS is the code the spec reserves
++				// for a name collision with an incompatible source.
++				klog.ErrorS(ferr, "CreateSnapshot: array-side name collision", "cluster", vol.Cluster(), "volumeID", vol.VolumeID(), "name", name)
++
++				return nil, status.Error(codes.AlreadyExists, ferr.Error())
++			}
++
++			klog.ErrorS(ferr, "CreateSnapshot: array snapshot failed", "cluster", vol.Cluster(), "volumeID", vol.VolumeID())
++
++			return nil, status.Error(codes.Internal, ferr.Error())
++		}
++
++		klog.V(3).InfoS("CreateSnapshot: array snapshot created", "cluster", vol.Cluster(), "volumeID", vol.VolumeID(), "arraySnapshot", snap.SnapshotName)
++
++		return &csi.CreateSnapshotResponse{
++			Snapshot: &csi.Snapshot{
++				// Stamped here rather than taken from the array, whose `time`
++				// field is YYMMDDHHMMSS in the array's own timezone. The
++				// sidecar persists only the first success, so a retry
++				// recomputing this is harmless.
++				CreationTime:   timestamppb.New(time.Now()),
++				SnapshotId:     FSSnapshotHandle(vol.Cluster(), vol.Storage(), snap.SnapshotName),
++				SourceVolumeId: request.GetSourceVolumeId(),
++				SizeBytes:      snap.SizeBytes,
++				ReadyToUse:     snap.Ready == 1,
++			},
++		}, nil
++	}
++
+ 	if storageConfig.Shared == 1 {
+ 		err = status.Error(codes.Internal, "shared storage does not support snapshot")
+ 		klog.ErrorS(err, "CreateSnapshot: unsupported storage type for snapshot", "cluster", vol.Cluster(), "storageID", vol.Storage(), "storageType", storageConfig.Type)
+@@ -917,6 +1005,63 @@ func (d *ControllerService) DeleteSnapshot(ctx context.Context, request *csi.Del
+ 		return nil, status.Error(codes.Internal, err.Error())
+ 	}
+ 
++	// FLASHSYSTEM: this MUST come before checkVolume, and the ordering is the
++	// whole reason snapshot handles carry a marker.
++	//
++	// checkVolume resolves through the PVE content listing, and the FlashSystem
++	// storage plugin deliberately never lists snapshot objects there - its
++	// volume-name grammar is dot-free precisely so "<volume>.<snap>" cannot
++	// masquerade as a volume. So a snapshot handle reaching checkVolume gets
++	// NotFound, which the block below turns into a SUCCESSFUL delete. Every
++	// snapshot deletion would report success having freed nothing, and on a
++	// data reduction pool that leaks physical capacity silently.
++	// The marker gates the dispatch, but on a flashsystem storage it must also
++	// be MANDATORY. Without this, a snapshot handle that lacks the marker falls
++	// through to upstream's code, which calls cl.DeleteVMDisk() — i.e. the
++	// plugin's free_image — and DELETES THE VOLUME rather than a snapshot. A
++	// hand-written VolumeSnapshotContent, or a handle minted by an older build,
++	// is enough to reach it.
++	arraySnap, isFSSnap := FSArraySnapName(vol)
++
++	// The storage lookup happens ONLY for an unmarked handle, and only to
++	// decide whether to refuse it — the marked path needs no extra REST call,
++	// and neither does any other backend.
++	//
++	// Best-effort by design: if the lookup fails we fall through to upstream's
++	// behaviour unchanged rather than turning a transient Proxmox error into a
++	// failed deletion. That leaves a narrow gap (an unmarked handle on a
++	// flashsystem storage AND a failed storage lookup would still reach
++	// DeleteVMDisk), which is acceptable because reaching it at all requires a
++	// hand-crafted VolumeSnapshotContent: nothing in this driver mints an
++	// unmarked snapshot handle.
++	if !isFSSnap {
++		if fsStorage, fserr := cl.Client.ClusterStorage(ctx, vol.Storage()); fserr != nil {
++			klog.V(4).InfoS("DeleteSnapshot: could not read storage config; not applying the flashsystem handle guard", "cluster", vol.Cluster(), "storageID", vol.Storage(), "err", fserr)
++		} else if fsStorage.Type == FSPluginType {
++			err = status.Errorf(codes.InvalidArgument,
++				"%s is not a flashsystem snapshot handle; refusing to treat it as a volume",
++				request.GetSnapshotId())
++			klog.ErrorS(err, "DeleteSnapshot: unmarked handle on a flashsystem storage", "cluster", vol.Cluster(), "storageID", vol.Storage())
++
++			return nil, err
++		}
++	}
++
++	if isFSSnap {
++		if ferr := FSDeleteSnapshot(ctx, cl, vol, arraySnap); ferr != nil {
++			klog.ErrorS(ferr, "DeleteSnapshot: array snapshot delete failed", "cluster", vol.Cluster(), "arraySnapshot", arraySnap)
++
++			return nil, status.Error(codes.Internal, ferr.Error())
++		}
++
++		// The plugin is idempotent on absence, which is what the spec requires
++		// of DeleteSnapshot, so an already-gone snapshot arrives here as a
++		// success rather than an error.
++		klog.V(3).InfoS("DeleteSnapshot: array snapshot deleted", "cluster", vol.Cluster(), "arraySnapshot", arraySnap)
++
++		return &csi.DeleteSnapshotResponse{}, nil
++	}
++
+ 	_, err = d.checkVolume(ctx, vol)
+ 	if err != nil {
+ 		if status.Code(err) == codes.NotFound {
+@@ -952,10 +1097,92 @@ func (d *ControllerService) DeleteSnapshot(ctx context.Context, request *csi.Del
+ }
+ 
+ // ListSnapshots list snapshots
+-func (d *ControllerService) ListSnapshots(_ context.Context, request *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
++//
++// FLASHSYSTEM: implemented for a snapshot handle or a source volume handle on a
++// flashsystem storage, and left Unimplemented otherwise so no behaviour changes
++// for any other backend.
++//
++// Worth having beyond the spec: external-snapshotter does not require
++// LIST_SNAPSHOTS, but without it there is no way to diff array state against
++// VolumeSnapshotContent objects - and on a data reduction pool a leaked
++// snapshot holds physical capacity in a pool shared with production workloads.
++func (d *ControllerService) ListSnapshots(ctx context.Context, request *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
+ 	klog.V(4).InfoS("ListSnapshots: called", "args", protosanitizer.StripSecrets(request))
+ 
+-	return nil, status.Error(codes.Unimplemented, "")
++	ref := request.GetSnapshotId()
++	if ref == "" {
++		ref = request.GetSourceVolumeId()
++	}
++
++	if ref == "" {
++		// A full cross-cluster listing is not something to synthesise: the
++		// pagination contract needs a stable ordering this backend cannot
++		// promise across clusters.
++		//
++		// The message stays EMPTY on purpose. Upstream's own
++		// configuredTestSuite.TestListSnapshots asserts
++		// status.Error(codes.Unimplemented, "") exactly, and a fork that has
++		// to rebase every few weeks is worth more than a friendlier string
++		// here - the code already says everything a caller can act on.
++		return nil, status.Error(codes.Unimplemented, "")
++	}
++
++	vol, err := volume.NewVolumeFromVolumeID(ref)
++	if err != nil {
++		return nil, status.Error(codes.InvalidArgument, err.Error())
++	}
++
++	cl, err := d.pxpool.GetProxmoxCluster(vol.Cluster())
++	if err != nil {
++		return nil, status.Error(codes.Internal, err.Error())
++	}
++
++	storageConfig, err := cl.Client.ClusterStorage(ctx, vol.Storage())
++	if err != nil {
++		return nil, status.Error(codes.Internal, err.Error())
++	}
++
++	if storageConfig.Type != FSPluginType {
++		return nil, status.Error(codes.Unimplemented, "")
++	}
++
++	// A snapshot_id query must answer with THAT snapshot, not the storage's
++	// whole namespace. Earlier this discarded the recovered array name and
++	// listed everything, so a caller asking about one snapshot got every
++	// snapshot on the tier — including other tenants' — reported as its own.
++	wantSnap, isSnap := FSArraySnapName(vol)
++
++	source := ""
++	if !isSnap {
++		source = vol.Disk()
++	}
++
++	snaps, err := FSListSnapshots(ctx, cl, vol.Cluster(), vol.Storage(), source)
++	if err != nil {
++		return nil, status.Error(codes.Internal, err.Error())
++	}
++
++	entries := []*csi.ListSnapshotsResponse_Entry{}
++
++	for _, s := range snaps {
++		// An absent snapshot_id is an empty list, which is what the spec asks
++		// for, rather than an error.
++		if isSnap && s.SnapshotName != wantSnap {
++			continue
++		}
++
++		entries = append(entries, &csi.ListSnapshotsResponse_Entry{
++			Snapshot: &csi.Snapshot{
++				SnapshotId:     FSSnapshotHandle(vol.Cluster(), vol.Storage(), s.SnapshotName),
++				SourceVolumeId: volume.NewVolume(vol.Cluster(), "", vol.Storage(), s.SourceVolname, "").VolumeSharedID(),
++				SizeBytes:      s.SizeBytes,
++				ReadyToUse:     s.Ready == 1,
++				CreationTime:   timestamppb.New(time.Now()),
++			},
++		})
++	}
++
++	return &csi.ListSnapshotsResponse{Entries: entries}, nil
+ }
+ 
+ // ControllerExpandVolume expand a volume
+diff --git a/pkg/csi/controller_test.go b/pkg/csi/controller_test.go
+index 34edc99..1995f41 100644
+--- a/pkg/csi/controller_test.go
++++ b/pkg/csi/controller_test.go
+@@ -592,7 +592,12 @@ func (ts *configuredTestSuite) TestControllerServiceControllerGetCapabilities()
+ 	ts.Require().NoError(err)
+ 	ts.Require().NotNil(resp)
+ 
+-	if len(resp.GetCapabilities()) != 9 {
++	// 9 upstream + LIST_SNAPSHOTS, which the FlashSystem backend must advertise
++	// or external-snapshotter's GetSnapshotStatus reports pre-provisioned
++	// content ready_to_use=true without asking the driver. This count is a
++	// canary for upstream changing the list, so it is bumped deliberately
++	// rather than loosened to an inequality.
++	if len(resp.GetCapabilities()) != 10 {
+ 		ts.T().Fatalf("unexpected number of capabilities: %d", len(resp.GetCapabilities()))
+ 	}
+ }

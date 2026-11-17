@@ -1,0 +1,117 @@
+# End-to-end smoke test for FlashSystem array snapshots — PART 2 of 2.
+#
+# APPLY ONLY AFTER job/fs-smoke-write REPORTS Complete:
+#   kubectl -n fs-smoke wait --for=condition=complete job/fs-smoke-write --timeout=5m
+#   kubectl apply -f smoke-test-restore.yaml
+#
+# Applying it earlier cuts the array snapshot while the 64 MiB write is still
+# in flight, and the verify job then reports a checksum mismatch that is a
+# race, not a storage fault.
+#
+# 2. SNAPSHOT — the thing this whole exercise is for.
+#      kubectl -n fs-smoke get volumesnapshot fs-smoke-snap -w
+#    Expect readyToUse: true within seconds — an array snapshot is instant.
+#    Then confirm the array actually has it, from a PVE node:
+#      pvesh get /nodes/$(hostname)/flashsystem/k8s-archive/snapshot
+#    A snapshot that sits at readyToUse: false forever with no events is the
+#    snapshotter sidecar being disabled.
+#
+# 3. RESTORE — the half that rests on mkvolume, and the half to distrust.
+#      kubectl -n fs-smoke get pvc fs-smoke-restored
+#      kubectl -n fs-smoke wait --for=condition=complete job/fs-smoke-verify --timeout=10m
+#      kubectl -n fs-smoke logs job/fs-smoke-verify
+#    The verify job re-reads the marker the write job left and FAILS LOUDLY if
+#    it differs. That comparison is the actual test: a restore that binds but
+#    serves the wrong bytes looks like a success everywhere else.
+#
+#    This step needs BOTH `pvesm set k8s-archive --fsrestore 1` AND
+#    tools/probe-clone-from-snapshot.sh having passed on the array. Without
+#    the flag, fs-smoke-restored stays Pending with a provisioner event naming
+#    the probe — that is the gate working, not a fault. The flag is not a
+#    formality: it is what keeps `mkvolume` off an array nobody has probed.
+#
+# Cleanup is step 4 in smoke-test.yaml, and its ORDER matters — read it there.
+
+---
+# 2. The array snapshot. Apply this AFTER the write job reports Complete —
+# an array snapshot is crash-consistent, so a snapshot taken mid-write
+# captures whatever was on the volume at that instant, which is a fine thing
+# to test but a confusing thing to debug.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: fs-smoke-snap
+  namespace: fs-smoke
+spec:
+  # Named explicitly. The class carries no default annotation, deliberately.
+  volumeSnapshotClassName: proxmox-flashsystem
+  source:
+    persistentVolumeClaimName: fs-smoke-src
+---
+# 3. A NEW volume restored from that snapshot. This is the mkvolume path.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fs-smoke-restored
+  namespace: fs-smoke
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: proxmox-archive
+  dataSource:
+    name: fs-smoke-snap
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  resources:
+    requests:
+      # Must be >= the snapshot's size. Asking for exactly the source size is
+      # the honest test; asking for more exercises the post-restore resize
+      # path as well, which is a separate thing to check deliberately.
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fs-smoke-verify
+  namespace: fs-smoke
+spec:
+  backoffLimit: 0    # a wrong restore must not be retried into looking flaky
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: verify
+          image: busybox:1.37
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo '--- what the restored volume contains ---'
+              ls -la /data
+              got_marker="$(cat /data/marker 2>/dev/null || echo MISSING)"
+              echo "marker: $got_marker"
+              if [ "$got_marker" != 'flashsystem-smoke-marker-v1' ]; then
+                echo "FAIL: marker mismatch. The volume bound, but it is not the"
+                echo "      snapshot's data. A restore that serves the wrong bytes"
+                echo "      looks like a success everywhere except here."
+                exit 1
+              fi
+              want="$(cat /data/payload.md5)"
+              got="$(md5sum /data/payload | cut -d' ' -f1)"
+              echo "payload want=$want got=$got"
+              if [ "$want" != "$got" ]; then
+                echo "FAIL: payload checksum mismatch."
+                echo "      If fsclonetype is 'clone', the array copies in the"
+                echo "      background at 2 MB/s by default - this can mean the"
+                echo "      clone was readable before its population finished,"
+                echo "      which is a real finding worth recording."
+                exit 1
+              fi
+              echo "PASS: restored volume matches the snapshot byte for byte."
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: fs-smoke-restored

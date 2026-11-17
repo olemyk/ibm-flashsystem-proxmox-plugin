@@ -190,11 +190,21 @@ const has = (name, html, needle, want = true) =>
     ok('perf: peak time drops the date', html.includes('2026-08-26 10:43:04'), false);
     // The event log keeps the full stamp, where the date is real information.
     ok('perf: full stamp still available', UI.stamp('260826104304'), '2026-08-26 10:43:04');
-    // The unit is genuinely ambiguous in IBM's own docs, so it must not be
-    // asserted on screen.
-    ok('perf: latency value carries no unit',
-        /Read latency<\/div><div class="fs-tile-v">10<\/div>/.test(html), true);
-    has('perf: ambiguity disclosed', html, 'microseconds or milliseconds');
+    // RESOLVED 2026-09-15 by IBM, from array output rather than documentation:
+    // the *_ms statistics are MILLISECONDS. On 9.1.0.2, mdisk_ms 10.103 is
+    // 10.103 ms and drive_ms 0.790 is 790 microseconds; on 8.3.1.10 the same
+    // fields are integers at lower precision. IBM's 8.7 docs contradict
+    // themselves (stat_name descriptions say microseconds, the attribute table
+    // says milliseconds) and the attribute table is the correct one.
+    //
+    // These previously asserted the OPPOSITE - that no unit was shown and the
+    // ambiguity was disclosed - which was right while it was unknown and is
+    // wrong now. Guessing the unit is a 1000x error, so it stays pinned.
+    has('perf: latency labelled in ms', html, 'Read latency (ms)');
+    has('perf: write latency too',      html, 'Write latency (ms)');
+    has('perf: note states the unit',   html, 'Latency is in milliseconds');
+    ok('perf: no longer claims ambiguity',
+        html.includes('microseconds or milliseconds'), false);
     // Long labels and values must not break the tile grid.
     has('perf: value uses tabular figures', html, 'fs-tile-v');
 }

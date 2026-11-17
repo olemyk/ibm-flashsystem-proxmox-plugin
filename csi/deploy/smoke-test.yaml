@@ -1,0 +1,108 @@
+# End-to-end smoke test for FlashSystem array snapshots from Kubernetes.
+# PART 1 of 2 — provision and write. The snapshot and restore objects live in
+# smoke-test-restore.yaml, and that separation is not tidiness: see step 1.
+#
+# Runs on the ARCHIVE tier on purpose: Pool3_Archive is the pool with real
+# headroom, and its StorageClass uses reclaimPolicy Retain, so a mistake here
+# does not take an array volume with it. Never point this at a tier that is
+# near physical-full.
+#
+#   kubectl apply -f smoke-test.yaml
+#
+# Then walk the four steps. Each one fails differently, and the whole point of
+# doing it in steps is that you learn WHICH half broke.
+#
+# 1. PROVISION — does the stock path still work?  (this file)
+#      kubectl -n fs-smoke get pvc fs-smoke-src
+#      kubectl -n fs-smoke wait --for=condition=complete job/fs-smoke-write --timeout=5m
+#      kubectl -n fs-smoke logs job/fs-smoke-write
+#    Expect Bound, and the job Complete. If the PVC sticks at Pending with
+#    "waiting for first consumer", that is normal until the job schedules.
+#    If it sticks after that, check CSIStorageCapacity objects exist:
+#      kubectl get csistoragecapacity -A | head
+#    None at all means the enableCapacity trap — see values-flashsystem.yaml.
+#
+#    DO NOT PROCEED until that job reports Complete, and do not apply the two
+#    files together. Applying the snapshot and restore objects in the same
+#    `kubectl apply` cuts the array snapshot concurrently with the 64 MiB
+#    write and starts the verify job immediately, so the checksum comparison —
+#    the actual test — fails on a perfectly good array and tells you nothing.
+#
+# 2-3. SNAPSHOT and RESTORE — smoke-test-restore.yaml, applied next.
+#
+# 4. CLEAN UP
+#      kubectl -n fs-smoke delete pvc fs-smoke-restored      # the clone FIRST
+#      kubectl -n fs-smoke delete volumesnapshot fs-smoke-snap
+#      kubectl delete namespace fs-smoke
+#      pvesh get /nodes/$(hostname)/flashsystem/k8s-archive/snapshot
+#    The last command is the one that matters: it tells you whether the array
+#    snapshot actually went away, or whether deleting the VolumeSnapshot
+#    reported success and freed nothing.
+#
+#    That deletion ORDER is load-bearing. With the default fsclonetype
+#    `thinclone` the restored volume PINS the snapshot it came from, and the
+#    array defers the snapshot's removal (dependent_deleting) until the clone
+#    is gone — so a snapshot that is merely waiting on its dependant looks
+#    exactly like a delete that silently freed nothing.
+#
+#    Because Archive is Retain, the array VOLUMES survive on purpose — remove
+#    them by hand:
+#      pvesm list k8s-archive
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fs-smoke
+---
+# 1. A volume on the array, and a known marker written into it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fs-smoke-src
+  namespace: fs-smoke
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: proxmox-archive
+  resources:
+    requests:
+      # The driver rounds up to a 512 MiB multiple, so ask for a multiple and
+      # the reported size matches the request.
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fs-smoke-write
+  namespace: fs-smoke
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: write
+          image: busybox:1.37
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # A fixed marker, so the verify job can assert an exact value
+              # rather than "some file exists".
+              echo 'flashsystem-smoke-marker-v1' > /data/marker
+              # Something with bulk, so a restore that silently serves an
+              # empty volume cannot pass by having the right small file.
+              dd if=/dev/urandom of=/data/payload bs=1M count=64
+              md5sum /data/payload | cut -d' ' -f1 > /data/payload.md5
+              sync
+              echo "wrote marker and 64MiB payload"
+              cat /data/marker
+              cat /data/payload.md5
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: fs-smoke-src
